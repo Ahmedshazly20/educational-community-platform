@@ -218,6 +218,7 @@ export function ExamBuilderPage() {
         questions.map((q, idx) => ({
           id: q.id,
           exam_id: q.exam_id,
+          question_type: q.question_type,
           position: idx + 1,
           prompt_html: q.prompt_html,
           points: q.points,

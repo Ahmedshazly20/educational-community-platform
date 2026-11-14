@@ -78,7 +78,11 @@ function getRange(page = 1, pageSize = 25): [number, number] {
 }
 
 export class SupabaseAdminApi implements AdminApi {
-  private sb = getSupabaseClient();
+  private sb: ReturnType<typeof getSupabaseClient>;
+
+  constructor(client?: ReturnType<typeof getSupabaseClient>) {
+    this.sb = client ?? getSupabaseClient();
+  }
 
   async getCurrentSession(): Promise<AuthSessionState | null> {
     const { data, error } = await this.sb.auth.getSession();
@@ -86,20 +90,41 @@ export class SupabaseAdminApi implements AdminApi {
     const user = data.session?.user;
     if (!user) return null;
 
-    const [{ data: profileData }, { data: rolesData }, { data: aalData }] = await Promise.all([
-      this.sb.from('staff_profiles').select('*').eq('id', user.id).maybeSingle(),
-      this.sb.from('staff_roles').select('role').eq('staff_id', user.id),
+    const [profileRes, rolesRes, aalRes] = await Promise.all([
+      this.sb
+        .from('staff_profiles')
+        .select('user_id, full_name, created_at, updated_at')
+        .eq('user_id', user.id)
+        .maybeSingle(),
+      this.sb.from('staff_roles').select('role').eq('user_id', user.id),
       this.sb.auth.mfa.getAuthenticatorAssuranceLevel(),
     ]);
+    if (profileRes.error) throw normalizeError(profileRes.error);
+    if (rolesRes.error) throw normalizeError(rolesRes.error);
 
-    const roles = (rolesData ?? []).map((r: { role: StaffRole }) => r.role);
+    const roles = ((rolesRes.data ?? []) as Array<{ role: StaffRole }>).map((r) => r.role);
+    const profileRow = profileRes.data as {
+      user_id: string;
+      full_name: string;
+      created_at: string;
+      updated_at: string;
+    } | null;
     const mfaReq = requiresMfa(roles);
-    const mfaVerified = !mfaReq || aalData?.currentLevel === 'aal2';
+    const mfaVerified = !mfaReq || aalRes.data?.currentLevel === 'aal2';
 
     return {
       userId: user.id,
       email: user.email ?? '',
-      profile: profileData ? { ...(profileData as Omit<StaffProfile, 'roles'>), roles } : null,
+      profile: profileRow
+        ? {
+            id: profileRow.user_id,
+            email: user.email ?? '',
+            full_name: profileRow.full_name,
+            is_active: true,
+            created_at: profileRow.created_at,
+            roles,
+          }
+        : null,
       roles,
       mfaRequired: mfaReq,
       mfaVerified,
@@ -150,6 +175,8 @@ export class SupabaseAdminApi implements AdminApi {
       termsRes,
       sessionsRes,
       inProgressRes,
+      pubExamsRes,
+      approvedResultsRes,
       pubLessonsRes,
       draftLessonsRes,
       auditRes,
@@ -181,10 +208,30 @@ export class SupabaseAdminApi implements AdminApi {
         .gte('ends_at', nowIso)
         .lte('starts_at', in24Iso),
       this.sb.from('exam_attempts').select('*', { count: 'exact', head: true }).eq('status', 'in_progress'),
+      this.sb.from('exams').select('id').eq('status', 'published'),
+      this.sb.from('exam_results').select('exam_id'),
       this.sb.from('lessons').select('*', { count: 'exact', head: true }).eq('status', 'published'),
       this.sb.from('lessons').select('*', { count: 'exact', head: true }).eq('status', 'draft'),
       this.sb.from('audit_log').select('*').order('created_at', { ascending: false }).limit(10),
     ]);
+
+    for (const res of [
+      pendingRes,
+      oldestPendingRes,
+      trialRes,
+      trial7Res,
+      blockedRes,
+      termsRes,
+      sessionsRes,
+      inProgressRes,
+      pubExamsRes,
+      approvedResultsRes,
+      pubLessonsRes,
+      draftLessonsRes,
+      auditRes,
+    ]) {
+      if (res.error) throw normalizeError(res.error);
+    }
 
     const terms = (termsRes.data ?? []) as Term[];
     const activeSubsByTerm = await Promise.all(
@@ -204,6 +251,45 @@ export class SupabaseAdminApi implements AdminApi {
       ? Math.max(0, Math.floor((Date.now() - new Date(oldestDate).getTime()) / 86400_000))
       : null;
 
+    const approvedExamIds = new Set(
+      ((approvedResultsRes.data ?? []) as Array<{ exam_id: string }>).map((r) => r.exam_id)
+    );
+    const examsAwaitingGradingCount = ((pubExamsRes.data ?? []) as Array<{ id: string }>).filter(
+      (e) => !approvedExamIds.has(e.id)
+    ).length;
+
+    const rawAudit = (auditRes.data ?? []) as Array<{
+      id: number | string;
+      actor_id: string;
+      action: string;
+      entity_type: string;
+      entity_id: string;
+      details: Record<string, unknown>;
+      created_at: string;
+    }>;
+    const actorIds = Array.from(new Set(rawAudit.map((r) => r.actor_id).filter(Boolean)));
+    const actorNameMap = new Map<string, string>();
+    if (actorIds.length > 0) {
+      const { data: staffRows } = await this.sb
+        .from('staff_profiles')
+        .select('user_id, full_name')
+        .in('user_id', actorIds);
+      for (const s of (staffRows ?? []) as Array<{ user_id: string; full_name: string }>) {
+        actorNameMap.set(s.user_id, s.full_name);
+      }
+    }
+
+    const recentAudit: AuditLogEntry[] = rawAudit.map((r) => ({
+      id: String(r.id),
+      actor_id: r.actor_id,
+      actor_name: actorNameMap.get(r.actor_id) ?? r.actor_id,
+      action: r.action,
+      entity_type: r.entity_type,
+      entity_id: r.entity_id,
+      details: r.details ?? {},
+      created_at: r.created_at,
+    }));
+
     return {
       pendingPaymentsCount: pendingRes.count ?? 0,
       oldestPendingDays,
@@ -213,13 +299,13 @@ export class SupabaseAdminApi implements AdminApi {
       blockedStudentsCount: blockedRes.count ?? 0,
       upcomingSessions24hCount: sessionsRes.count ?? 0,
       attemptsInProgressCount: inProgressRes.count ?? 0,
-      examsAwaitingGradingCount: 0,
+      examsAwaitingGradingCount,
       lessonsPublishedCount: pubLessonsRes.count ?? 0,
       lessonsDraftCount: draftLessonsRes.count ?? 0,
       termsMissingAccessEnd: terms.filter(
         (t) => !t.access_ends_at || new Date(t.access_ends_at).getTime() <= Date.now()
       ),
-      recentAudit: (auditRes.data ?? []) as AuditLogEntry[],
+      recentAudit,
     };
   }
 
@@ -498,7 +584,13 @@ export class SupabaseAdminApi implements AdminApi {
 
   async getAllowedLinkDomains(): Promise<AllowedLinkDomain[]> {
     const { data, error } = await this.sb.from('allowed_link_domains').select('*').order('domain');
-    return unwrapList(data as AllowedLinkDomain[] | null, error);
+    if (error) throw normalizeError(error);
+    return ((data ?? []) as Array<{ domain: string; kind: LinkKind; is_active: boolean }>).map((r) => ({
+      id: r.domain,
+      domain: r.domain,
+      kind: r.kind,
+      is_active: r.is_active,
+    }));
   }
 
   async createAllowedLinkDomain(input: {
@@ -506,8 +598,17 @@ export class SupabaseAdminApi implements AdminApi {
     kind: LinkKind;
     is_active: boolean;
   }): Promise<AllowedLinkDomain> {
-    const { data, error } = await this.sb.from('allowed_link_domains').insert(input).select().single();
-    return unwrap(data as AllowedLinkDomain | null, error);
+    const { data, error } = await this.sb
+      .from('allowed_link_domains')
+      .insert({
+        domain: input.domain.trim().toLowerCase(),
+        kind: input.kind,
+        is_active: input.is_active,
+      })
+      .select()
+      .single();
+    const row = unwrap(data as { domain: string; kind: LinkKind; is_active: boolean } | null, error);
+    return { id: row.domain, domain: row.domain, kind: row.kind, is_active: row.is_active };
   }
 
   async updateAllowedLinkDomain(
@@ -516,26 +617,50 @@ export class SupabaseAdminApi implements AdminApi {
   ): Promise<AllowedLinkDomain> {
     const { data, error } = await this.sb
       .from('allowed_link_domains')
-      .update(input)
-      .eq('id', id)
+      .update({
+        domain: input.domain.trim().toLowerCase(),
+        kind: input.kind,
+        is_active: input.is_active,
+      })
+      .eq('domain', id)
       .select()
       .single();
-    return unwrap(data as AllowedLinkDomain | null, error);
+    const row = unwrap(data as { domain: string; kind: LinkKind; is_active: boolean } | null, error);
+    return { id: row.domain, domain: row.domain, kind: row.kind, is_active: row.is_active };
   }
 
   async deleteAllowedLinkDomain(id: string): Promise<void> {
-    const { error } = await this.sb.from('allowed_link_domains').delete().eq('id', id);
+    const { error } = await this.sb.from('allowed_link_domains').delete().eq('domain', id);
     if (error) throw normalizeError(error);
   }
 
   async getLessons(filter: LessonsFilter): Promise<PaginatedResult<LessonWithContext>> {
     const [from, to] = getRange(filter.page ?? 1, filter.pageSize ?? 50);
+    const [tcs, tracks, stages] = await Promise.all([
+      this.getTrackCourses(),
+      this.getTracks(),
+      this.getStages(),
+    ]);
+
+    let allowedCourseIds: string[] | null = null;
+    if (filter.trackId) {
+      allowedCourseIds = tcs.filter((tc) => tc.track_id === filter.trackId).map((tc) => tc.course_id);
+    } else if (filter.stageId) {
+      const stageTrackIds = new Set(tracks.filter((t) => t.stage_id === filter.stageId).map((t) => t.id));
+      allowedCourseIds = tcs.filter((tc) => stageTrackIds.has(tc.track_id)).map((tc) => tc.course_id);
+    }
+
+    if (allowedCourseIds && allowedCourseIds.length === 0) {
+      return { items: [], total: 0 };
+    }
+
     let q = this.sb
       .from('lessons')
       .select('*, courses(name_ar), terms(name_ar), lesson_items(id, item_type)', { count: 'exact' })
       .order('sort_order');
 
     if (filter.courseId) q = q.eq('course_id', filter.courseId);
+    if (allowedCourseIds) q = q.in('course_id', Array.from(new Set(allowedCourseIds)));
     if (filter.termId) q = q.eq('term_id', filter.termId);
     if (filter.status && filter.status !== 'all') q = q.eq('status', filter.status);
     if (filter.search?.trim()) {
@@ -544,12 +669,6 @@ export class SupabaseAdminApi implements AdminApi {
     }
     const { data, count, error } = await q.range(from, to);
     if (error) throw normalizeError(error);
-
-    const [tcs, tracks, stages] = await Promise.all([
-      this.getTrackCourses(),
-      this.getTracks(),
-      this.getStages(),
-    ]);
 
     const items = (data ?? []).map((row: Record<string, unknown>) => {
       const cId = String(row.course_id);
@@ -594,6 +713,9 @@ export class SupabaseAdminApi implements AdminApi {
         .eq('lesson_id', lessonId)
         .order('sort_order'),
     ]);
+    if (courseRes.error) throw normalizeError(courseRes.error);
+    if (termRes.error) throw normalizeError(termRes.error);
+    if (itemsRes.error) throw normalizeError(itemsRes.error);
 
     const linkedTracks = tcs
       .filter((tc) => tc.course_id === les.course_id)
@@ -672,11 +794,20 @@ export class SupabaseAdminApi implements AdminApi {
     const { data: items } = await this.sb.from('lesson_items').select('id').eq('lesson_id', lessonId);
     const ids = (items ?? []).map((i: { id: string }) => i.id);
     if (ids.length === 0) return { progressCount: 0, answersCount: 0 };
-    const { count: progressCount } = await this.sb
-      .from('item_progress')
-      .select('*', { count: 'exact', head: true })
-      .in('item_id', ids);
-    return { progressCount: progressCount ?? 0, answersCount: 0 };
+    const [{ count: progressCount }, { data: qqRows }] = await Promise.all([
+      this.sb.from('item_progress').select('*', { count: 'exact', head: true }).in('item_id', ids),
+      this.sb.from('quick_questions').select('id').in('item_id', ids),
+    ]);
+    const qIds = ((qqRows ?? []) as Array<{ id: string }>).map((q) => q.id);
+    let answersCount = 0;
+    if (qIds.length > 0) {
+      const { count } = await this.sb
+        .from('quick_answers')
+        .select('*', { count: 'exact', head: true })
+        .in('question_id', qIds);
+      answersCount = count ?? 0;
+    }
+    return { progressCount: progressCount ?? 0, answersCount };
   }
 
   async deleteLesson(lessonId: string): Promise<void> {
@@ -755,11 +886,23 @@ export class SupabaseAdminApi implements AdminApi {
   }
 
   async getLessonItemDeleteImpact(itemId: string): Promise<{ progressCount: number; answersCount: number }> {
-    const { count } = await this.sb
-      .from('item_progress')
-      .select('*', { count: 'exact', head: true })
-      .eq('item_id', itemId);
-    return { progressCount: count ?? 0, answersCount: 0 };
+    const [{ count }, { data: qqRows }] = await Promise.all([
+      this.sb
+        .from('item_progress')
+        .select('*', { count: 'exact', head: true })
+        .eq('item_id', itemId),
+      this.sb.from('quick_questions').select('id').eq('item_id', itemId),
+    ]);
+    const qIds = ((qqRows ?? []) as Array<{ id: string }>).map((q) => q.id);
+    let answersCount = 0;
+    if (qIds.length > 0) {
+      const { count: aCount } = await this.sb
+        .from('quick_answers')
+        .select('*', { count: 'exact', head: true })
+        .in('question_id', qIds);
+      answersCount = aCount ?? 0;
+    }
+    return { progressCount: count ?? 0, answersCount };
   }
 
   async deleteLessonItem(itemId: string): Promise<void> {
@@ -872,6 +1015,27 @@ export class SupabaseAdminApi implements AdminApi {
 
   async getSubscriptions(filter: SubscriptionsFilter): Promise<PaginatedResult<Subscription>> {
     const [from, to] = getRange(filter.page ?? 1, filter.pageSize ?? 25);
+
+    let stageTrackIds: string[] | null = null;
+    if (filter.stageId && !filter.trackId) {
+      const tracks = await this.getTracks(filter.stageId);
+      stageTrackIds = tracks.map((t) => t.id);
+      if (stageTrackIds.length === 0) return { items: [], total: 0 };
+    }
+
+    let matchingStudentIds: string[] | null = null;
+    if (filter.search?.trim()) {
+      const s = `%${filter.search.trim()}%`;
+      const { data: matchedProfiles, error: mErr } = await this.sb
+        .from('profiles')
+        .select('id')
+        .or(`full_name.ilike.${s},phone.ilike.${s}`)
+        .limit(500);
+      if (mErr) throw normalizeError(mErr);
+      matchingStudentIds = ((matchedProfiles ?? []) as Array<{ id: string }>).map((p) => p.id);
+      if (matchingStudentIds.length === 0) return { items: [], total: 0 };
+    }
+
     let q = this.sb
       .from('subscriptions')
       .select('*, profiles(full_name, phone), tracks(name_ar, stage_id), terms(name_ar)', { count: 'exact' })
@@ -880,6 +1044,8 @@ export class SupabaseAdminApi implements AdminApi {
     if (filter.status && filter.status !== 'all') q = q.eq('status', filter.status);
     if (filter.termId) q = q.eq('term_id', filter.termId);
     if (filter.trackId) q = q.eq('track_id', filter.trackId);
+    if (stageTrackIds) q = q.in('track_id', stageTrackIds);
+    if (matchingStudentIds) q = q.in('student_id', matchingStudentIds);
     if (filter.fromDate) q = q.gte('starts_at', filter.fromDate);
     if (filter.toDate) q = q.lte('starts_at', filter.toDate);
     const { data, count, error } = await q.range(from, to);
@@ -889,7 +1055,8 @@ export class SupabaseAdminApi implements AdminApi {
       ...(r as unknown as Subscription),
       student_name: (r.profiles as { full_name?: string } | null)?.full_name,
       student_phone: (r.profiles as { phone?: string } | null)?.phone,
-      track_name: (r.tracks as { name_ar?: string } | null)?.name_ar,
+      track_name: (r.tracks as { name_ar?: string; stage_id?: string } | null)?.name_ar,
+      stage_id: (r.tracks as { stage_id?: string } | null)?.stage_id,
       term_name: (r.terms as { name_ar?: string } | null)?.name_ar,
     }));
     return { items, total: count ?? items.length };
@@ -954,6 +1121,7 @@ export class SupabaseAdminApi implements AdminApi {
 
   async getStudents(filter: StudentsFilter): Promise<PaginatedResult<StudentOverviewRow>> {
     const [from, to] = getRange(filter.page ?? 1, filter.pageSize ?? 25);
+    const nowIso = new Date().toISOString();
     let q = this.sb
       .from('v_students_overview')
       .select('*', { count: 'exact' })
@@ -965,7 +1133,19 @@ export class SupabaseAdminApi implements AdminApi {
     }
     if (filter.governorateId) q = q.eq('governorate_id', filter.governorateId);
     if (filter.administrationId) q = q.eq('administration_id', filter.administrationId);
+    if (filter.stageId) q = q.eq('stage_id', filter.stageId);
     if (filter.trackId) q = q.eq('track_id', filter.trackId);
+    if (filter.status && filter.status !== 'all') {
+      if (filter.status === 'blocked') {
+        q = q.eq('is_blocked', true);
+      } else if (filter.status === 'subscribed') {
+        q = q.eq('is_blocked', false).gt('active_subscriptions_count', 0);
+      } else if (filter.status === 'trial') {
+        q = q.eq('is_blocked', false).eq('active_subscriptions_count', 0).gt('trial_ends_at', nowIso);
+      } else if (filter.status === 'expired') {
+        q = q.eq('is_blocked', false).eq('active_subscriptions_count', 0).lte('trial_ends_at', nowIso);
+      }
+    }
     if (filter.fromDate) q = q.gte('created_at', filter.fromDate);
     if (filter.toDate) q = q.lte('created_at', filter.toDate);
     const { data, count, error } = await q.range(from, to);
@@ -980,13 +1160,29 @@ export class SupabaseAdminApi implements AdminApi {
   }> {
     const [stuRes, subRes, payRes] = await Promise.all([
       this.sb.from('v_students_overview').select('*').eq('id', studentId).single(),
-      this.sb.from('subscriptions').select('*').eq('student_id', studentId).order('created_at', { ascending: false }),
-      this.sb.from('v_payment_queue').select('*').eq('student_id', studentId).order('created_at', { ascending: false }),
+      this.sb
+        .from('subscriptions')
+        .select('*, tracks(name_ar, stage_id), terms(name_ar)')
+        .eq('student_id', studentId)
+        .order('created_at', { ascending: false }),
+      this.sb
+        .from('v_payment_queue')
+        .select('*')
+        .eq('student_id', studentId)
+        .order('created_at', { ascending: false }),
     ]);
     if (stuRes.error) throw normalizeError(stuRes.error);
+    if (subRes.error) throw normalizeError(subRes.error);
+    if (payRes.error) throw normalizeError(payRes.error);
+    const subscriptions = ((subRes.data ?? []) as Array<Record<string, unknown>>).map((r) => ({
+      ...(r as unknown as Subscription),
+      track_name: (r.tracks as { name_ar?: string } | null)?.name_ar,
+      stage_id: (r.tracks as { stage_id?: string } | null)?.stage_id,
+      term_name: (r.terms as { name_ar?: string } | null)?.name_ar,
+    }));
     return {
       student: stuRes.data as StudentOverviewRow,
-      subscriptions: (subRes.data ?? []) as Subscription[],
+      subscriptions,
       payments: (payRes.data ?? []) as PaymentQueueRow[],
     };
   }
@@ -996,13 +1192,54 @@ export class SupabaseAdminApi implements AdminApi {
     quickAnswers: StudentQuickAnswer[];
   }> {
     const [progRes, ansRes] = await Promise.all([
-      this.sb.from('item_progress').select('*').eq('student_id', studentId),
-      this.sb.from('quick_answers').select('*').eq('student_id', studentId),
+      this.sb
+        .from('item_progress')
+        .select('student_id, item_id, completed_at, lesson_items(title, lesson_id, lessons(title))')
+        .eq('student_id', studentId),
+      this.sb
+        .from('quick_answers')
+        .select(
+          'student_id, question_id, selected_option_id, is_correct, answered_at, quick_questions(prompt), quick_question_options(option_text)'
+        )
+        .eq('student_id', studentId),
     ]);
-    return {
-      progress: (progRes.data ?? []) as StudentItemProgress[],
-      quickAnswers: (ansRes.data ?? []) as StudentQuickAnswer[],
-    };
+    if (progRes.error) throw normalizeError(progRes.error);
+    if (ansRes.error) throw normalizeError(ansRes.error);
+
+    const progress: StudentItemProgress[] = ((progRes.data ?? []) as Array<Record<string, unknown>>).map(
+      (row) => {
+        const item = row.lesson_items as {
+          title?: string;
+          lesson_id?: string;
+          lessons?: { title?: string } | null;
+        } | null;
+        return {
+          item_id: String(row.item_id),
+          item_title: item?.title ?? String(row.item_id),
+          lesson_id: item?.lesson_id ?? '',
+          lesson_title: item?.lessons?.title ?? '—',
+          completed_at: String(row.completed_at),
+        };
+      }
+    );
+
+    const quickAnswers: StudentQuickAnswer[] = ((ansRes.data ?? []) as Array<Record<string, unknown>>).map(
+      (row) => {
+        const qq = row.quick_questions as { prompt?: string } | null;
+        const opt = row.quick_question_options as { option_text?: string } | null;
+        const qId = String(row.question_id);
+        return {
+          id: qId,
+          question_id: qId,
+          prompt: qq?.prompt ?? qId,
+          selected_option_text: opt?.option_text ?? '—',
+          is_correct: Boolean(row.is_correct),
+          answered_at: String(row.answered_at),
+        };
+      }
+    );
+
+    return { progress, quickAnswers };
   }
 
   async getStudentExams(studentId: string): Promise<{
@@ -1011,11 +1248,20 @@ export class SupabaseAdminApi implements AdminApi {
   }> {
     const [attRes, resRes] = await Promise.all([
       this.sb.from('exam_attempts').select('*').eq('student_id', studentId),
-      this.sb.from('exam_results').select('*').eq('student_id', studentId),
+      this.sb.from('exam_results').select('*, exams(title)').eq('student_id', studentId),
     ]);
+    if (attRes.error) throw normalizeError(attRes.error);
+    if (resRes.error) throw normalizeError(resRes.error);
+
+    const results: ExamResultRow[] = ((resRes.data ?? []) as Array<Record<string, unknown>>).map((r) => ({
+      ...(r as unknown as ExamResultRow),
+      id: String(r.attempt_id),
+      exam_title: (r.exams as { title?: string } | null)?.title,
+    }));
+
     return {
       attempts: (attRes.data ?? []) as ExamAttempt[],
-      results: (resRes.data ?? []) as ExamResultRow[],
+      results,
     };
   }
 
@@ -1096,12 +1342,20 @@ export class SupabaseAdminApi implements AdminApi {
       this.sb.from('exam_sessions').select('*').eq('exam_id', examId).order('starts_at'),
       this.sb.from('exam_results').select('*', { count: 'exact', head: true }).eq('exam_id', examId),
     ]);
+    if (courseRes.error) throw normalizeError(courseRes.error);
+    if (termRes.error) throw normalizeError(termRes.error);
+    if (qRes.error) throw normalizeError(qRes.error);
+    if (sRes.error) throw normalizeError(sRes.error);
+    if (resCount.error) throw normalizeError(resCount.error);
 
     const sessions = (sRes.data ?? []) as ExamSession[];
     const sessionIds = sessions.map((s) => s.id);
-    const audRes = sessionIds.length
-      ? await this.sb.from('session_audience').select('*').in('session_id', sessionIds)
-      : { data: [] };
+    let audiences: SessionAudience[] = [];
+    if (sessionIds.length > 0) {
+      const audRes = await this.sb.from('session_audience').select('*').in('session_id', sessionIds);
+      if (audRes.error) throw normalizeError(audRes.error);
+      audiences = (audRes.data ?? []) as SessionAudience[];
+    }
 
     const linkedTracks = tcs
       .filter((tc) => tc.course_id === exam.course_id)
@@ -1120,7 +1374,7 @@ export class SupabaseAdminApi implements AdminApi {
       tracks: linkedTracks,
       questions: (qRes.data ?? []) as ExamQuestion[],
       sessions,
-      audiences: (audRes.data ?? []) as SessionAudience[],
+      audiences,
       isLocked: sessions.some((s) => new Date(s.starts_at).getTime() <= now),
       isApproved: (resCount.count ?? 0) > 0,
     };
@@ -1311,7 +1565,14 @@ export class SupabaseAdminApi implements AdminApi {
 
   async reorderExamQuestions(
     _examId: string,
-    rows: Array<{ id: string; exam_id: string; position: number; prompt_html: string; points: number }>
+    rows: Array<{
+      id: string;
+      exam_id: string;
+      question_type: QuestionType;
+      position: number;
+      prompt_html: string;
+      points: number;
+    }>
   ): Promise<void> {
     const { error } = await this.sb.from('exam_questions').upsert(rows, { onConflict: 'id' });
     if (error) throw new AppError('REORDER_FAILED');
@@ -1368,7 +1629,8 @@ export class SupabaseAdminApi implements AdminApi {
       .select('*')
       .eq('exam_id', examId)
       .order('exported_at', { ascending: false });
-    return unwrapList(data as GradingBatch[] | null, error);
+    if (error) throw normalizeError(error);
+    return (data ?? []) as GradingBatch[];
   }
 
   async exportGrading(examId: string): Promise<{ batch: GradingBatch; rows: GradingExportRow[] }> {
@@ -1395,12 +1657,14 @@ export class SupabaseAdminApi implements AdminApi {
   async getExamResults(examId: string): Promise<ExamResultRow[]> {
     const { data, error } = await this.sb
       .from('exam_results')
-      .select('*, profiles(full_name, phone)')
+      .select('*, profiles(full_name, phone), exams(title)')
       .eq('exam_id', examId)
       .order('total_score', { ascending: false });
     if (error) throw normalizeError(error);
     return (data ?? []).map((r: Record<string, unknown>) => ({
       ...(r as unknown as ExamResultRow),
+      id: String(r.attempt_id),
+      exam_title: (r.exams as { title?: string } | null)?.title,
       student_name: (r.profiles as { full_name?: string } | null)?.full_name,
       student_phone: (r.profiles as { phone?: string } | null)?.phone,
     }));
@@ -1431,7 +1695,21 @@ export class SupabaseAdminApi implements AdminApi {
       .order('created_at', { ascending: false })
       .range(from, to);
     if (error) throw normalizeError(error);
-    return { items: (data ?? []) as Announcement[], total: count ?? 0 };
+    const raw = (data ?? []) as Announcement[];
+
+    const [tracks, govs] = await Promise.all([
+      raw.some((a) => a.track_id) ? this.getTracks() : Promise.resolve([]),
+      raw.some((a) => a.governorate_id) ? this.getGovernorates() : Promise.resolve([]),
+    ]);
+    const trackMap = new Map(tracks.map((t) => [t.id, t.name_ar]));
+    const govMap = new Map(govs.map((g) => [g.id, g.name_ar]));
+
+    const items = raw.map((a) => ({
+      ...a,
+      track_name: a.track_id ? (trackMap.get(a.track_id) ?? null) : null,
+      governorate_name: a.governorate_id ? (govMap.get(a.governorate_id) ?? null) : null,
+    }));
+    return { items, total: count ?? 0 };
   }
 
   async countAnnouncementRecipients(
@@ -1463,14 +1741,56 @@ export class SupabaseAdminApi implements AdminApi {
 
   async getReportsBundle(filter: ReportsFilter): Promise<ReportBundle> {
     const CAP = 20000;
-    const [payRes, subRes, stuRes, lesRes, exRes, resRes] = await Promise.all([
-      this.getPaymentQueue({ status: 'approved', fromDate: filter.fromDate, toDate: filter.toDate, termId: filter.termId, trackId: filter.trackId, page: 1, pageSize: 1000 }),
-      this.getSubscriptions({ fromDate: filter.fromDate, toDate: filter.toDate, termId: filter.termId, trackId: filter.trackId, stageId: filter.stageId, page: 1, pageSize: 1000 }),
-      this.getStudents({ fromDate: filter.fromDate, toDate: filter.toDate, trackId: filter.trackId, page: 1, pageSize: 1000 }),
-      this.getLessons({ termId: filter.termId, trackId: filter.trackId, stageId: filter.stageId, page: 1, pageSize: 1000 }),
-      this.getExams({ termId: filter.termId }),
-      this.sb.from('exam_results').select('*').limit(1000),
-    ]);
+    const [payRes, subRes, stuRes, lesRes, exRes, resRes, progRes, ansTotalRes, ansCorrectRes] =
+      await Promise.all([
+        this.getPaymentQueue({
+          status: 'approved',
+          fromDate: filter.fromDate,
+          toDate: filter.toDate,
+          termId: filter.termId,
+          trackId: filter.trackId,
+          page: 1,
+          pageSize: 1000,
+        }),
+        this.getSubscriptions({
+          fromDate: filter.fromDate,
+          toDate: filter.toDate,
+          termId: filter.termId,
+          trackId: filter.trackId,
+          stageId: filter.stageId,
+          page: 1,
+          pageSize: 1000,
+        }),
+        this.getStudents({
+          fromDate: filter.fromDate,
+          toDate: filter.toDate,
+          trackId: filter.trackId,
+          stageId: filter.stageId,
+          page: 1,
+          pageSize: 1000,
+        }),
+        this.getLessons({
+          termId: filter.termId,
+          trackId: filter.trackId,
+          stageId: filter.stageId,
+          page: 1,
+          pageSize: 1000,
+        }),
+        this.getExams({ termId: filter.termId }),
+        this.sb.from('exam_results').select('*, profiles(full_name, phone), exams(title)').limit(1000),
+        this.sb.from('item_progress').select('*', { count: 'exact', head: true }),
+        this.sb.from('quick_answers').select('*', { count: 'exact', head: true }),
+        this.sb.from('quick_answers').select('*', { count: 'exact', head: true }).eq('is_correct', true),
+      ]);
+    if (resRes.error) throw normalizeError(resRes.error);
+
+    const results: ExamResultRow[] = ((resRes.data ?? []) as Array<Record<string, unknown>>).map((r) => ({
+      ...(r as unknown as ExamResultRow),
+      id: String(r.attempt_id),
+      exam_title: (r.exams as { title?: string } | null)?.title,
+      student_name: (r.profiles as { full_name?: string } | null)?.full_name,
+      student_phone: (r.profiles as { phone?: string } | null)?.phone,
+    }));
 
     const totalFetched = payRes.total + subRes.total + stuRes.total;
     return {
@@ -1481,24 +1801,41 @@ export class SupabaseAdminApi implements AdminApi {
       students: stuRes.items,
       lessons: lesRes.items,
       exams: exRes,
-      results: (resRes.data ?? []) as ExamResultRow[],
-      itemProgressCount: 0,
-      quickAnswersStats: { total: 0, correct: 0 },
+      results,
+      itemProgressCount: progRes.count ?? 0,
+      quickAnswersStats: {
+        total: ansTotalRes.count ?? 0,
+        correct: ansCorrectRes.count ?? 0,
+      },
     };
   }
 
   async getStaffList(): Promise<StaffProfile[]> {
     const [{ data: profiles, error: pErr }, { data: roles, error: rErr }] = await Promise.all([
-      this.sb.from('staff_profiles').select('*').order('created_at'),
-      this.sb.from('staff_roles').select('*'),
+      this.sb
+        .from('staff_profiles')
+        .select('user_id, full_name, created_at, updated_at')
+        .order('created_at'),
+      this.sb.from('staff_roles').select('user_id, role'),
     ]);
     if (pErr) throw normalizeError(pErr);
     if (rErr) throw normalizeError(rErr);
 
-    const roleRows = (roles ?? []) as Array<{ staff_id: string; role: StaffRole }>;
-    return ((profiles ?? []) as Omit<StaffProfile, 'roles'>[]).map((p) => ({
-      ...p,
-      roles: roleRows.filter((r) => r.staff_id === p.id).map((r) => r.role),
+    const roleRows = (roles ?? []) as Array<{ user_id: string; role: StaffRole }>;
+    const profileRows = (profiles ?? []) as Array<{
+      user_id: string;
+      full_name: string;
+      created_at: string;
+      updated_at: string;
+    }>;
+
+    return profileRows.map((p) => ({
+      id: p.user_id,
+      email: '',
+      full_name: p.full_name,
+      is_active: true,
+      created_at: p.created_at,
+      roles: roleRows.filter((r) => r.user_id === p.user_id).map((r) => r.role),
     }));
   }
 
@@ -1514,20 +1851,38 @@ export class SupabaseAdminApi implements AdminApi {
   }
 
   async updateStaffRoles(staffId: string, roles: StaffRole[]): Promise<void> {
-    const { error: delErr } = await this.sb.from('staff_roles').delete().eq('staff_id', staffId);
-    if (delErr) throw normalizeError(delErr);
-    const { error: insErr } = await this.sb
+    const { data: currentRows, error: fetchErr } = await this.sb
       .from('staff_roles')
-      .insert(roles.map((role) => ({ staff_id: staffId, role })));
-    if (insErr) throw normalizeError(insErr);
+      .select('role')
+      .eq('user_id', staffId);
+    if (fetchErr) throw normalizeError(fetchErr);
+
+    const current = ((currentRows ?? []) as Array<{ role: StaffRole }>).map((r) => r.role);
+    const toRemove = current.filter((r) => !roles.includes(r));
+    const toAdd = roles.filter((r) => !current.includes(r));
+
+    if (toRemove.length > 0) {
+      const { error: delErr } = await this.sb
+        .from('staff_roles')
+        .delete()
+        .eq('user_id', staffId)
+        .in('role', toRemove);
+      if (delErr) throw normalizeError(delErr);
+    }
+
+    if (toAdd.length > 0) {
+      const { error: insErr } = await this.sb
+        .from('staff_roles')
+        .insert(toAdd.map((role) => ({ user_id: staffId, role })));
+      if (insErr) throw normalizeError(insErr);
+    }
   }
 
-  async setStaffActive(staffId: string, isActive: boolean): Promise<void> {
-    const { error } = await this.sb
-      .from('staff_profiles')
-      .update({ is_active: isActive })
-      .eq('id', staffId);
-    if (error) throw normalizeError(error);
+  async setStaffActive(_staffId: string, _isActive: boolean): Promise<void> {
+    throw new AppError(
+      'NOT_ALLOWED',
+      'تعطيل/تفعيل الموظف غير مدعوم في مخطط قاعدة البيانات الحالي؛ يرجى تعديل أو سحب الأدوار الوظيفية.'
+    );
   }
 
   async getAuditLog(filter: AuditFilter): Promise<PaginatedResult<AuditLogEntry>> {
@@ -1543,7 +1898,39 @@ export class SupabaseAdminApi implements AdminApi {
     if (filter.toDate) q = q.lte('created_at', filter.toDate);
     const { data, count, error } = await q.range(from, to);
     if (error) throw normalizeError(error);
-    return { items: (data ?? []) as AuditLogEntry[], total: count ?? 0 };
+
+    const raw = (data ?? []) as Array<{
+      id: number | string;
+      actor_id: string;
+      action: string;
+      entity_type: string;
+      entity_id: string;
+      details: Record<string, unknown>;
+      created_at: string;
+    }>;
+    const actorIds = Array.from(new Set(raw.map((r) => r.actor_id).filter(Boolean)));
+    const actorNameMap = new Map<string, string>();
+    if (actorIds.length > 0) {
+      const { data: staffRows } = await this.sb
+        .from('staff_profiles')
+        .select('user_id, full_name')
+        .in('user_id', actorIds);
+      for (const s of (staffRows ?? []) as Array<{ user_id: string; full_name: string }>) {
+        actorNameMap.set(s.user_id, s.full_name);
+      }
+    }
+
+    const items: AuditLogEntry[] = raw.map((r) => ({
+      id: String(r.id),
+      actor_id: r.actor_id,
+      actor_name: actorNameMap.get(r.actor_id) ?? r.actor_id,
+      action: r.action,
+      entity_type: r.entity_type,
+      entity_id: r.entity_id,
+      details: r.details ?? {},
+      created_at: r.created_at,
+    }));
+    return { items, total: count ?? 0 };
   }
 
   async getYearEndReports(): Promise<YearEndReport[]> {

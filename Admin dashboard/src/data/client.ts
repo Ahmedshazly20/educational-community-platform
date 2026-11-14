@@ -411,7 +411,14 @@ export interface AdminApi {
   deleteExamQuestion(examId: string, questionId: string): Promise<void>;
   reorderExamQuestions(
     examId: string,
-    rows: Array<{ id: string; exam_id: string; position: number; prompt_html: string; points: number }>
+    rows: Array<{
+      id: string;
+      exam_id: string;
+      question_type: QuestionType;
+      position: number;
+      prompt_html: string;
+      points: number;
+    }>
   ): Promise<void>;
 
   createExamSession(input: {

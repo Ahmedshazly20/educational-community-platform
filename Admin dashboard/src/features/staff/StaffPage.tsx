@@ -2,7 +2,7 @@ import React from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Shield, UserPlus } from 'lucide-react';
 import { ar } from '../../i18n/ar';
-import { api } from '../../data';
+import { api, isMockMode } from '../../data';
 import { keys } from '../../data/keys';
 import { createStaffSchema } from '../../data/schemas';
 import type { StaffProfile, StaffRole } from '../../data/types';
@@ -150,9 +150,9 @@ export function StaffPage() {
               <thead className="border-b border-slate-200 bg-slate-50 text-xs text-slate-600">
                 <tr>
                   <th className="px-4 py-3">{ar.staff.fullName}</th>
-                  <th className="px-4 py-3">{ar.auth.email}</th>
+                  {isMockMode && <th className="px-4 py-3">{ar.auth.email}</th>}
                   <th className="px-4 py-3">{ar.staff.roles}</th>
-                  <th className="px-4 py-3">{ar.app.status}</th>
+                  {isMockMode && <th className="px-4 py-3">{ar.app.status}</th>}
                   <th className="px-4 py-3">{ar.app.createdAt}</th>
                   <th className="px-4 py-3">{ar.app.actions}</th>
                 </tr>
@@ -161,7 +161,9 @@ export function StaffPage() {
                 {staff.map((m) => (
                   <tr key={m.id}>
                     <td className="px-4 py-3 font-semibold text-slate-900">{m.full_name}</td>
-                    <td className="px-4 py-3 font-mono text-xs text-slate-600">{m.email}</td>
+                    {isMockMode && (
+                      <td className="px-4 py-3 font-mono text-xs text-slate-600">{m.email || '—'}</td>
+                    )}
                     <td className="px-4 py-3">
                       <div className="flex flex-wrap gap-1.5">
                         {m.roles.map((r) => (
@@ -169,12 +171,14 @@ export function StaffPage() {
                         ))}
                       </div>
                     </td>
-                    <td className="px-4 py-3">
-                      <StatusTag
-                        tone={m.is_active ? 'success' : 'danger'}
-                        label={m.is_active ? ar.academic.active : ar.academic.inactive}
-                      />
-                    </td>
+                    {isMockMode && (
+                      <td className="px-4 py-3">
+                        <StatusTag
+                          tone={m.is_active ? 'success' : 'danger'}
+                          label={m.is_active ? ar.academic.active : ar.academic.inactive}
+                        />
+                      </td>
+                    )}
                     <td className="px-4 py-3 font-mono text-xs tabular-nums text-slate-500">
                       {formatCairoDate(m.created_at)}
                     </td>
@@ -191,13 +195,15 @@ export function StaffPage() {
                           <Shield className="h-3.5 w-3.5" />
                           تعديل الأدوار
                         </Button>
-                        <Button
-                          variant={m.is_active ? 'danger' : 'secondary'}
-                          size="sm"
-                          onClick={() => setToggleTarget(m)}
-                        >
-                          {m.is_active ? 'تعطيل' : 'تفعيل'}
-                        </Button>
+                        {isMockMode && (
+                          <Button
+                            variant={m.is_active ? 'danger' : 'secondary'}
+                            size="sm"
+                            onClick={() => setToggleTarget(m)}
+                          >
+                            {m.is_active ? 'تعطيل' : 'تفعيل'}
+                          </Button>
+                        )}
                       </div>
                     </td>
                   </tr>

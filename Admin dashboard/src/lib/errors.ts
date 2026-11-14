@@ -31,6 +31,32 @@ interface PostgrestLikeError {
   hint?: string;
 }
 
+function extractSqlState(err: unknown): string {
+  if (!err || typeof err !== 'object') return '';
+  const rec = err as PostgrestLikeError;
+  if (typeof rec.code === 'string' && rec.code.trim()) {
+    return rec.code.trim();
+  }
+  if (typeof rec.message === 'string') {
+    const trimmed = rec.message.trim();
+    if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+      try {
+        const parsed = JSON.parse(trimmed) as { code?: unknown };
+        if (typeof parsed.code === 'string' && parsed.code.trim()) {
+          return parsed.code.trim();
+        }
+      } catch {
+        // Ignore malformed JSON
+      }
+    }
+    const match = trimmed.match(/\b(42703|42P01|23503|23505|23514|42501)\b/);
+    if (match?.[1]) {
+      return match[1];
+    }
+  }
+  return '';
+}
+
 export function normalizeError(err: unknown): AppError {
   if (err instanceof AppError) {
     return err;
@@ -40,10 +66,21 @@ export function normalizeError(err: unknown): AppError {
     return new AppError('NETWORK_OFFLINE');
   }
 
+  if (typeof err === 'string') {
+    const match = err.match(/\b(42703|42P01)\b/);
+    if (match?.[1]) {
+      return new AppError(
+        'DATA_CONNECTION_ERROR',
+        `${ar.errors.DATA_CONNECTION_ERROR} (${match[1]})`,
+        { rawCode: match[1] }
+      );
+    }
+  }
+
   if (err && typeof err === 'object') {
     const pg = err as PostgrestLikeError;
     const msg = typeof pg.message === 'string' ? pg.message : '';
-    const sqlState = typeof pg.code === 'string' ? pg.code : '';
+    const sqlState = extractSqlState(err);
 
     // Check UNGRADED_ANSWERS: N pattern
     const ungradedMatch = msg.match(/UNGRADED_ANSWERS\s*:?\s*(\d+)/i);
@@ -71,6 +108,13 @@ export function normalizeError(err: unknown): AppError {
       }
     }
 
+    if (sqlState === '42703' || sqlState === '42P01') {
+      return new AppError(
+        'DATA_CONNECTION_ERROR',
+        `${ar.errors.DATA_CONNECTION_ERROR} (${sqlState})`,
+        { rawCode: sqlState }
+      );
+    }
     if (sqlState === '23503') {
       return new AppError('FK_BLOCKED', ar.errors.FK_BLOCKED, { rawCode: sqlState });
     }
@@ -82,6 +126,13 @@ export function normalizeError(err: unknown): AppError {
     }
     if (sqlState === '42501') {
       return new AppError('NOT_ALLOWED', ar.errors.NOT_ALLOWED, { rawCode: sqlState });
+    }
+
+    if (
+      msg.toLowerCase().includes('invalid login credentials') ||
+      (pg as { code?: string }).code === 'invalid_credentials'
+    ) {
+      return new AppError('INVALID_CREDENTIALS', ar.errors.INVALID_CREDENTIALS, { rawCode: msg || 'invalid_credentials' });
     }
 
     if (msg.toLowerCase().includes('failed to fetch') || msg.toLowerCase().includes('network')) {
