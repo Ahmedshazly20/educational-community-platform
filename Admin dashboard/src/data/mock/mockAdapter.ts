@@ -2589,7 +2589,11 @@ export class MockAdminApi implements AdminApi {
     return [...this.db.yearEndReports];
   }
 
-  async registerYearEndReport(academicYear: string, pdfPath: string): Promise<YearEndReport> {
+  async registerYearEndReport(
+    academicYear: string,
+    pdfPath: string,
+    _studentId?: string
+  ): Promise<YearEndReport> {
     const actor = this.requirePerm('year_end:manage');
     if (!/^\d{4}-\d{4}$/.test(academicYear.trim())) throw new AppError('INVALID_ACADEMIC_YEAR');
     if (!pdfPath.trim()) throw new AppError('PDF_PATH_REQUIRED');

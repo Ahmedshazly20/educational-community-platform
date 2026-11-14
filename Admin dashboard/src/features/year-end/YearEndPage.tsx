@@ -2,7 +2,7 @@ import React from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { AlertTriangle, FileText, Trash2 } from 'lucide-react';
 import { ar } from '../../i18n/ar';
-import { api } from '../../data';
+import { api, isMockMode } from '../../data';
 import { keys } from '../../data/keys';
 import { yearEndRegisterSchema } from '../../data/schemas';
 import { useNotify } from '../../hooks/useNotify';
@@ -28,7 +28,14 @@ export function YearEndPage() {
     queryFn: () => api.getYearEndReports(),
   });
 
+  const studentsQ = useQuery({
+    queryKey: ['yearEnd', 'students'],
+    queryFn: () => api.getStudents({ page: 1, pageSize: 100 }),
+    enabled: !isMockMode,
+  });
+
   const [academicYear, setAcademicYear] = React.useState('2025-2026');
+  const [studentId, setStudentId] = React.useState('');
   const [pdfPath, setPdfPath] = React.useState('');
   const [regError, setRegError] = React.useState<string | undefined>();
 
@@ -38,6 +45,10 @@ export function YearEndPage() {
 
   const registerMut = useMutation({
     mutationFn: async () => {
+      if (!isMockMode && !studentId.trim()) {
+        setRegError('يرجى اختيار الطالب أو إدخال معرفه (p_student)');
+        throw new Error('VALIDATION');
+      }
       const parsed = yearEndRegisterSchema.safeParse({
         academic_year: academicYear,
         pdf_path: pdfPath,
@@ -47,7 +58,11 @@ export function YearEndPage() {
         throw new Error('VALIDATION');
       }
       setRegError(undefined);
-      return api.registerYearEndReport(parsed.data.academic_year, parsed.data.pdf_path);
+      return api.registerYearEndReport(
+        parsed.data.academic_year,
+        parsed.data.pdf_path,
+        studentId.trim() || undefined
+      );
     },
     onSuccess: (rep) => {
       setPdfPath('');
@@ -108,6 +123,24 @@ export function YearEndPage() {
               className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm font-mono text-left"
             />
           </div>
+
+          {!isMockMode && (
+            <div>
+              <label className="mb-1 block text-sm font-medium text-slate-700">الطالب</label>
+              <select
+                value={studentId}
+                onChange={(e) => setStudentId(e.target.value)}
+                className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm"
+              >
+                <option value="">اختر الطالب...</option>
+                {(studentsQ.data?.items ?? []).map((st) => (
+                  <option key={st.id} value={st.id}>
+                    {st.full_name} ({st.phone})
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
 
           <div>
             <label className="mb-1 block text-sm font-medium text-slate-700">{ar.yearEnd.pdfPath}</label>

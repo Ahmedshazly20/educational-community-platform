@@ -486,7 +486,7 @@ export interface AdminApi {
 
   // Year End
   getYearEndReports(): Promise<YearEndReport[]>;
-  registerYearEndReport(academicYear: string, pdfPath: string): Promise<YearEndReport>;
+  registerYearEndReport(academicYear: string, pdfPath: string, studentId?: string): Promise<YearEndReport>;
   purgeYearEndDetails(academicYear: string, confirmation: string): Promise<number>;
 
   // Verification helpers (used in automated acceptance tests on mock adapter)

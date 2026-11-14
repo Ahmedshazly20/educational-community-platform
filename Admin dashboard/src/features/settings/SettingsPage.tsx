@@ -2,7 +2,7 @@ import React from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Plus, Trash2, Upload } from 'lucide-react';
 import { ar } from '../../i18n/ar';
-import { api } from '../../data';
+import { api, isMockMode } from '../../data';
 import { keys } from '../../data/keys';
 import { allowedDomainSchema } from '../../data/schemas';
 import type { LinkKind, Term } from '../../data/types';
@@ -280,15 +280,19 @@ export function SettingsPage() {
                     {d.domain}
                   </span>
                   <StatusTag tone="info" label={ar.content.linkKinds[d.kind]} />
-                  <StatusTag
-                    tone={d.is_active ? 'success' : 'neutral'}
-                    label={d.is_active ? ar.academic.active : ar.academic.inactive}
-                  />
+                  {isMockMode && (
+                    <StatusTag
+                      tone={d.is_active ? 'success' : 'neutral'}
+                      label={d.is_active ? ar.academic.active : ar.academic.inactive}
+                    />
+                  )}
                 </div>
                 <div className="flex items-center gap-2">
-                  <Button variant="secondary" size="sm" onClick={() => toggleDomainMut.mutate(d)}>
-                    {d.is_active ? 'تعطيل' : 'تفعيل'}
-                  </Button>
+                  {isMockMode && (
+                    <Button variant="secondary" size="sm" onClick={() => toggleDomainMut.mutate(d)}>
+                      {d.is_active ? 'تعطيل' : 'تفعيل'}
+                    </Button>
+                  )}
                   <Button
                     variant="ghost"
                     size="sm"
