@@ -1,0 +1,276 @@
+# EXECUTION PROMPT — Admin Dashboard (apps/admin) — "مجتمع ثانوية عامة" (v2, full rewrite)
+
+You are a **Senior Software Architect & Tech Lead (10+ years)** with deep EdTech and complex-admin-console experience. Build the **Admin Dashboard** of an Egyptian secondary-school learning community. This prompt **replaces** every earlier admin prompt (`01_admin_web_prompt.md`, `02_admin_acceptance_tests.md` are superseded). Scope is the **Admin Dashboard only** (integration points with the student web / Android app are explained where they matter, nothing else is built).
+
+**Hard rules for you, the coding agent**
+1. The **database is frozen**. It is the contract. Do **not** create tables, columns, enums, views, RPCs, triggers or policies. If a screen needs something the schema does not provide, build only what is supported, and list the gap in `docs/SCHEMA_GAPS.md` (never fake it in the UI).
+2. **No decorative screens.** Every visible button/field must perform a real operation against the data layer or must not exist. No "coming soon", no dead links, no fake data in production code paths.
+3. **Do not guess business logic.** Everything you need is in this document and in the schema it references. If something is ambiguous, write it in `docs/OPEN_QUESTIONS.md` and implement the safest reading stated here.
+4. UI language: **Arabic, RTL only**. All user-visible strings live in `src/i18n/ar.ts`. This prompt is English only because you are the reader.
+5. Security never relies on hiding buttons: the database (RLS + RPC role checks) is the authority; the UI must also cope gracefully when it says no.
+
+---
+## 1. Project Context & Business Overview
+- Platform: educational **Community** for Egyptian secondary school (Thanaweya Amma). Clients: Android app (Expo), student web (Next.js), **admin web (React + Vite) — this task**. Backend: Supabase (PostgreSQL, Auth, Storage, pg_cron). Arabic/RTL only.
+- Students sign up with an Egyptian mobile number (login e-mail is derived: `01xxxxxxxxx@students.local`) with governorate, optional educational administration, **track (القسم/الشعبة)**, optional guardian phone. Each student gets a **30-day free trial** (once per phone and per Android device).
+- **Access rule (single source of truth in DB: `app.student_has_access`)**: a student can see a term's content and take its exams if they are not blocked AND (their trial is running OR they hold an **active subscription for their own track + that term**). The subscription covers **the whole term — every subject (course) of the student's track in that term. There is NEVER a subscription, price or access per subject.**
+- One active session per student (single device). Video links are Android-only; PDFs are **not** supported (documents are external links, e.g. Google Drive).
+- Exams: central exams made of MCQ + essay questions, run in **sessions** (different audience/time per session, e.g. Giza 4 PM / Nasr City 6 PM), anonymous essay grading through Excel (the grader never sees student identity), results visible only after the **admin** approves and every session has ended.
+
+## 2. Product Scope, Frozen Decisions, and What the Schema Does NOT Support
+**Frozen decisions (from the product owner):**
+- Grade level = `stages` (e.g. «الصف الثالث الثانوي»). Track/Section = `tracks` (علمي علوم / علمي رياضة / أدبي …) belonging to one stage. **There is no separate "educational stage" level above grade.**
+- Hierarchy that exists: **Stage(grade) → Track(section) → Course(subject) [via `track_courses`]**, and **Term** is a global dimension (الترم الأول/الثاني). A **Lesson belongs to (Course, Term)**, a Lesson has ordered **Items** (article | link | quick_questions).
+- **No Units level** (no `units` table). Lessons are a flat ordered list per (course, term). Do not build units, do not fake them with prefixes.
+- **No PDF/file attachments.** Documents/videos are **links** to allowed domains (`allowed_link_domains`, kinds `video`/`document`). Only images are uploaded (bucket `content-media`).
+- **Exams are linked to Course + Term** (not to a unit or lesson), run in sessions with audience filters.
+- Subscription = per **track + term** (`plans`, `subscriptions`); trial = 30 days (hard-wired in DB).
+
+**Not supported by the schema — do NOT build, document in `docs/SCHEMA_GAPS.md`:** units; PDF attachments; payment-method column (InstaPay/Vodafone Cash/bank) — only `sender_phone` + optional proof image exist; a settings table (trial length, payment instructions); cancelling a subscription (no RPC/grant; status `cancelled` exists but is unreachable); deleting/merging/changing the phone of a student; resetting a student's password (needs an Edge Function); duplicating lessons/exams atomically; server-side aggregate reports (no views/RPCs — see §13); lesson/exam reorder RPC (see §6.9 for the bulk-upsert approach).
+
+**`is_active` caveat:** `courses.is_active` and `tracks.is_active` do **not** hide content from students (RLS looks at lesson status only). `tracks.is_active=false` only blocks choosing the track at sign-up/transfer. Label them accordingly; to hide content use lesson status `draft`/`archived`.
+
+## 3. Admin Roles & Permissions (exact, from RLS and RPC checks)
+`admin` satisfies **every** role check. Roles: `admin, students_manager, payments_reviewer, support, content, exams, grader`. A user with no staff role is not allowed in (screen «غير مصرح»). Roles are read from `staff_roles` (own rows) + `staff_profiles`.
+
+| Capability | Who (besides admin) | DB mechanism |
+|---|---|---|
+| Read reference data (governorates, administrations, stages, tracks, terms, courses, track_courses, allowed_link_domains) | all staff | select policies |
+| Write reference data, plans, allowed domains | admin only | RLS `all` policies |
+| Lessons, items, quick questions (+ options with correct flag) | content | RLS |
+| Upload images to `content-media` | content, exams | storage policies |
+| Exams, questions, options, sessions, audience | exams | RLS |
+| Read student profiles/overview | students_manager, support, payments_reviewer | `profiles_staff` |
+| Extend trial, block/unblock, grant subscription | students_manager | RPC |
+| Change student track; change governorate/administration | students_manager, support | RPC |
+| Reset student device session | support | RPC (`reset_student_session`) |
+| Payment queue, approve/reject, proof images | payments_reviewer | RPC + storage policy |
+| Read payment_requests / subscriptions | payments_reviewer, students_manager, support | RLS |
+| Send announcements; read announcement history | students_manager | RPC `send_announcement` / RLS |
+| Read attempts / results / session stats | exams, students_manager (attempts, results); exams (question_stats) | RLS / RPC |
+| Grading export & import | grader | RPC |
+| Read grading batches | grader, exams | RLS |
+| Read essay_grades | exams | RLS |
+| **Approve results** | **admin only** | `approve_grading` |
+| List essay answers WITH student name; adjust one essay grade | admin only | RPC |
+| Staff & roles, audit log, year-end reports | admin only | RLS / RPC |
+
+Navigation is built from this matrix (`lib/permissions.ts`): hide unauthorized items, **and** guard routes, **and** map every `NOT_ALLOWED`/`42501`/RLS error to a friendly Arabic message. Never grant UI power the matrix does not give.
+
+## 4. Complete Admin Information Architecture (sidebar, RTL)
+1. **لوحة التحكم** (Dashboard) — all staff (cards limited by role)
+2. **المحتوى التعليمي** (Curriculum & Content) — content, admin
+   2.1 المنهج (Curriculum browser: stage → track → course → term → lessons)
+   2.2 الدروس وعناصرها (Lesson editor)
+3. **الهيكل الأكاديمي** (Academic structure) — admin write / staff read: الصفوف، المسارات، المواد وربطها بالمسارات، الترمات
+4. **الطلاب** — students_manager, support, payments_reviewer(read)
+5. **الاشتراكات والأسعار** — admin (plans), students_manager/payments_reviewer/support (read subscriptions)
+6. **المدفوعات** — payments_reviewer
+7. **الامتحانات** — exams (builder, sessions, monitoring, statistics)
+8. **التصحيح والنتائج** — grader (export/import), exams (view), admin (approve/adjust)
+9. **الإعلانات** — students_manager
+10. **التقارير والتصدير** — role-scoped
+11. **الفريق والصلاحيات** — admin
+12. **سجل النشاط** — admin
+13. **الإعدادات** — admin (only what the schema supports: allowed link domains, terms access end date, governorates/administrations; read-only info)
+14. **نهاية العام** — admin
+Plus: login (+ MFA), profile/logout, unauthorized, 404, error boundary.
+
+## 5. Tech Stack & Engineering Rules (do not add libraries outside this list; justify any addition in `docs/DECISIONS.md` first)
+React 18 + Vite + TypeScript **strict** (no `any`, no non-null `!` abuse, no `@ts-ignore`), React Router, **TanStack Query** (all server state, caching, invalidation by key factories), **TanStack Table**, **Zustand** (only for genuinely shared client state: session/roles, sidebar, wizard drafts), **React Hook Form + Zod**, **TipTap** (articles), **SheetJS (`xlsx`)**, **DOMPurify**, `@supabase/supabase-js`, `packages/design-tokens` + `packages/ui` (green g700 `#187750` for primary actions), IBM Plex Sans Arabic, Vitest + Testing Library + Playwright. **No** drag-and-drop library (reordering = move-up/move-down buttons + optional native HTML5 drag), **no** extra UI kit, **no** analytics SDK.
+Architecture:
+```
+apps/admin/src/
+  app/ (router, providers, layout)      lib/ (permissions, errors, format, xlsx, sanitize, link-domains)
+  data/ client.ts (AdminApi interface + types, Zod schemas)  supabase/ (real adapter)  mock/ (adapter for tests/dev)  keys.ts (query-key factories)
+  features/<module>/ (pages, components, hooks, schemas)      i18n/ar.ts
+```
+- **UI never calls supabase directly**; only through `AdminApi` hooks. UI = presentation; rules = DB. Zod mirrors DB constraints for early feedback only (the DB stays authoritative, its error wins).
+- Pagination, sorting, search and filters are **server-side** (`range`, `order`, `ilike`, `eq`, `count: 'exact'`). Debounce search 300 ms. Never load unbounded lists.
+- Uniform error pipeline: `AppError{code, message?, details?}`; Supabase/PostgREST errors normalized: DB `raise exception 'CODE…'` text → code; SQLSTATE `23503`→`FK_BLOCKED`, `23505`→`DUPLICATE`, `23514`→`CHECK_FAILED`, `42501`→`NOT_ALLOWED`, `P0001` → parse the leading CODE. One `errors.ts` Arabic map (§17). Toasts for success, inline for form errors, a blocking dialog for destructive/long operations.
+- Every list/detail has **Loading (skeleton), Empty (with the next action), Error (retry)** states. Destructive/irreversible actions use a confirm dialog that states the consequence.
+- Responsive 1024–1920 primary, usable at 768; accessible (keyboard, focus trap, aria-labels in Arabic, contrast). Dates in `Africa/Cairo`, Latin digits, EGP formatting «300 ج.م».
+- Mock adapter must reproduce DB rules and error codes and is used for unit/e2e tests; the **Supabase adapter is the product** (see §15).
+
+## 6. Complete Content Management Workflow (highest priority)
+### 6.1 Mental model (must be visible in the UI)
+`Stage (grade)` ⟶ `Track (section)` ⟶ `Course (subject)`; `Term` is chosen separately; **Lessons live under (Course, Term)**; **Items live under a Lesson**. A course may belong to several tracks (and even several stages) through `track_courses`, therefore **a lesson of that course is visible to every track that includes the course** (subject to the student's term access). The UI must always show this "audience impact".
+
+### 6.2 Curriculum browser (`/content`)
+- Left: a **tree** (collapsible): Stage → Track → Course. Each course node shows counts: lessons published/draft per term. Search box filters the tree (by stage/track/course name). Selecting a Course node opens the **course workspace** in the main pane with a **Term switcher** (tabs: الترم الأول / الترم الثاني) and the **ordered lessons list**.
+- Lessons list columns: order #, title, status badge (مسودة/منشور/مؤرشف), items count (+ types icons), published_at, updated_at, actions: تعديل، معاينة، نشر/إلغاء النشر، أرشفة، تحريك لأعلى/لأسفل، حذف. Filters: status, text search (title/summary, server-side `ilike`).
+- Top of workspace: breadcrumb «الصف › القسم › المادة › الترم» and the **audience banner**: «هذا المحتوى سيظهر لطلاب: [list of tracks (with stage) that include this course]». If more than one track or stage → show a warning box explaining that content is shared by all these tracks and that to separate it, a separate course must be created in Academic Structure.
+- Empty states: tree empty → "ابدأ بإنشاء صف ومسار" (link; admin only); course with no lessons for the term → "أضف أول درس" (button).
+
+### 6.3 "Add lesson" flow (dependent selects — exactly this)
+Entry points: global «إضافة درس» button, and the course workspace (pre-filled). Form step 1 — **Educational context** (all required, each select depends on the previous):
+1. **الصف الدراسي** (`stages`) →
+2. **القسم/المسار** (`tracks` where `stage_id` = chosen; show inactive tracks greyed but selectable for content) →
+3. **المادة** (`courses` joined through `track_courses` of the chosen track only) →
+4. **الترم** (`terms`).
+Changing an upstream select clears the downstream ones. The context persists on `lessons` only as `course_id` + `term_id` (stage/track are navigation; say so in a helper text and show the audience banner right after choosing the course).
+Step 2 — **Lesson data**: `title` (2–200), `summary` (≤1000, optional), position (default = last; `sort_order` = max+1 within (course, term)), initial status = `draft`. Save → creates the lesson → redirects to the **lesson editor** where items are added. A lesson cannot be published before having items.
+Errors: duplicate sort order is handled by the system (use max+1 inside a retry); `FK_BLOCKED` etc. per §17.
+
+### 6.4 Lesson editor (`/content/lessons/:id`)
+Header: context breadcrumb (read-only), title/summary inline edit, status badge, actions: معاينة (student view), نشر، إلغاء النشر، أرشفة، حذف. Body: **ordered items list** with add-item menu (3 types), move up/down, edit, delete, and per-item validation badge.
+- **Item type `article`**: title (1–200) + **TipTap editor** (headings H2–H3, bold/italic, lists, links https, blockquote, images). Save **both** `body_json` (editor doc) and `body_html` (DOMPurify-sanitized HTML: allow p, h2–h4, ul, ol, li, strong, em, a[href https only], img[src only from `content-media` public URL host], br, blockquote, table family; strip everything else). Required together by the `lesson_items_shape` constraint; `url` must be null.
+- **Item type `link`**: title + `url` (https). Live hint (client-side mirror of the DB check) shows the matched domain, detected kind (فيديو / مستند) and the Android-only badge for video; unmatched domain → inline error but still let the DB make the final decision. The DB sets `link_kind`/`android_only` — display them after save, never send them. Allowed domains are managed in Settings (admin). Errors: `LINK_MUST_BE_HTTPS`, `LINK_DOMAIN_NOT_ALLOWED`. Explain in the form: «الفيديوهات متاحة على تطبيق الأندرويد فقط، والمستندات (مثل Google Drive) تعمل على الجميع».
+- **Item type `quick_questions`** (title only on the item; questions below): add/edit/delete/reorder questions: `prompt` (required), `explanation` (optional), options list (add/remove/reorder, text required) with a **single correct** radio (DB: partial unique index → exactly ≤1 correct; publishing requires ≥2 options and exactly 1 correct per question). Show per-question validity badges (✓ / ⚠ missing correct / ⚠ < 2 options). Student never sees the correct flag except after answering (DB/RPC concern).
+- **Images**: upload (drag/paste/choose) → bucket `content-media`, path `article/<new-uuid>/<file>`; client-side checks: jpeg/png/webp, ≤ 5 MB (`FILE_TYPE_NOT_ALLOWED`/`FILE_TOO_LARGE`), progress bar, insert public URL into editor; delete from storage when removed (best effort).
+- Autosave is **not** used; explicit «حفظ» with dirty-state indicator and unsaved-changes guard on navigation.
+
+### 6.5 Publishing rules (enforced by DB trigger; UI pre-validates and shows the checklist)
+Publish checklist (computed in UI, DB decides): (a) lesson has ≥ 1 item; (b) every quick-question has ≥ 2 options and exactly 1 correct; (c) every `quick_questions` item has ≥ 1 question. Failure codes: `LESSON_HAS_NO_ITEMS`, `QUICK_QUESTION_INVALID`, `QUICK_QUESTIONS_ITEM_EMPTY` → show the checklist with the failing row highlighted. Publish sets `status='published'` and `published_at`. **Unpublish** → back to `draft`; **Archive** → `archived` (hidden from students, kept for history). A published lesson stays editable, but warn: «التعديل يظهر للطلاب فورًا».
+
+### 6.6 Preview before publishing
+«معاينة» opens a read-only **student-style rendering** of the lesson built from the admin's own data (same sanitizer): article HTML, document links (new tab), video links shown as «متاح على تطبيق الأندرويد» card, quick questions interactive in-memory (shows correct answer + explanation after choosing; **no DB writes, no progress**). A banner «وضع المعاينة» is always visible.
+
+### 6.7 Deletion & integrity rules (pre-check in UI, DB is final)
+- Delete **item**: confirm; cascades its quick questions/options and students' progress/answers for it → say so in the dialog (show counts from `item_progress`/`quick_answers` if readable by role).
+- Delete **lesson**: allowed (cascades items/progress). If the lesson is published and has student progress → strong warning + suggest **Archive** instead.
+- Delete **course/track/stage/term/plan/governorate/administration**: the DB uses `ON DELETE RESTRICT` where data depends on it. Before deleting, run dependency count queries and show «لا يمكن الحذف لأنه مرتبط بـ: 12 درس، 3 امتحانات…» with the buttons disabled; if a race makes the DB reject, map `FK_BLOCKED` to the same style message. Deleting a `track_courses` link is allowed but warn that students of that track immediately lose that subject's lessons/exams.
+- Never offer delete for: students, attempts, results, subscriptions, payments, audit log.
+
+### 6.8 Search & filter inside content
+Global content search box (title/summary of lessons, scoped to the selected course/term or across all with filters stage/track/course/term/status), server-side, paginated, results show the full breadcrumb and open the editor.
+
+### 6.9 Ordering
+`sort_order` uniqueness (lessons per (course,term); items per lesson; quick questions per item; options per question; exam questions per exam) is **DEFERRABLE INITIALLY DEFERRED**. Reordering = ONE request that updates the whole affected list: PostgREST bulk `upsert` with `onConflict: 'id'` sending **all NOT NULL columns of each row** (e.g. for lessons: `id, course_id, term_id, title, sort_order`) so the constraint is checked at statement end. On failure, refetch and show `REORDER_FAILED`. Record in `SCHEMA_GAPS.md` that a dedicated reorder RPC would be safer.
+
+## 7. Curriculum Hierarchy & Relationships (Academic Structure screens, admin write)
+- **Stages (الصفوف)** — fields: `name_ar` (unique), `sort_order`. Table with reorder; delete blocked by tracks.
+- **Tracks (الأقسام/المسارات)** — `stage_id`, `name_ar` (unique per stage), `is_active`, `sort_order`; filter by stage; shows #students, #courses; deactivate = cannot be chosen at sign-up/transfer (explain). Delete blocked by students/plans/subscriptions/payments.
+- **Courses (المواد)** — `name_ar` (**globally unique**), `icon_key` (choose from a fixed icon set defined in design-tokens; free text not allowed), `sort_order`, `is_active` (display flag, caveat §2). Detail tab **"المسارات"**: manage `track_courses` (add/remove track with per-track `sort_order`), grouped by stage. Show which tracks use it and the audience-impact warning when linking a course already used elsewhere.
+- **Terms (الترمات)** — fixed global entries with `name_ar` (unique), `sort_order`, **`access_ends_at`** (when purchased access for that term stops; **must be set each year before approving payments**, else `TERM_ACCESS_END_NOT_SET`). Show a red banner on Dashboard/Payments when a term has no future `access_ends_at`.
+- **Governorates / Administrations** (Settings): governorates (27 seeded) editable; administrations per governorate (`name_ar` unique per governorate, `is_active`). Bulk import of administrations from Excel (columns: `governorate`, `administration`) — validate in browser, insert in one request, report duplicates.
+- Relationship view: a read-only **matrix** page "تغطية المنهج": rows = tracks (grouped by stage), columns = courses, cell = ✓ (linked) with lesson counts per term (published/draft). Used for QA of content coverage.
+
+## 8. Subscription & Pricing Business Logic
+**Core rule (put it in the UI copy and in code comments):** subscription = **track × term**, covers **all courses** of that track in that term. No per-course price or subscription anywhere.
+- **Plans** (`plans`): one price per (track, term): `track_id`, `term_id`, `price_egp > 0`, `is_active`; **exactly one active plan per (track, term)** (partial unique index). Screen "الأسعار": a **pricing matrix** — rows = tracks grouped by stage (grade), columns = terms; each cell = active price or «غير مسعّر» with «إضافة سعر». Actions: add (creates active plan), edit price (confirm: «لن يؤثر على الاشتراكات السابقة»; history is preserved because requests/subscriptions store a price snapshot), deactivate (then the track-term can't be purchased: students see `NO_PLAN_FOR_TRACK_TERM`), delete only if never used (`FK_BLOCKED` otherwise). Price must be > 0.
+- **Trial**: 30 days from sign-up, once per phone and per device (DB trigger). Read-only explanation in Settings; **not configurable**. Admin tools: `extend_trial(student, days 1..365)`.
+- **Subscription lifecycle** (`subscriptions`): created by **approve_payment** (price snapshot, `ends_at` = `p_ends_at` or `terms.access_ends_at`) or by **grant_subscription** (manual, price 0, note). No overlapping `active` subscription for the same student+term (`ALREADY_SUBSCRIBED`). Expiry: pg_cron flips `active → expired` hourly after `ends_at`. Renewal = the student pays again for the next term (or, if expired, same term with a new `access_ends_at`); there is no cancel (gap).
+- **Subscriptions list** (read; students_manager/payments_reviewer/support): filters status, term, track, stage, date ranges (starts/ends), search by student name/phone (via joined profile), amount; columns: student, track, term, price paid, starts, ends, status, source (payment request / manual grant + note). Row action: open student; **«منح اشتراك»** (students_manager) from student page: term select (only terms with plans or any term? → any term), `ends_at` defaulting to the term's `access_ends_at` (required, must be in the future), note.
+- Students with expired/active status: surfaced in Students list filters («اشتراك ساري»، «منتهي»، «في التجربة»، «تجربة منتهية بلا اشتراك»).
+
+## 9. Payments Management
+- Student submits `payment_requests` (term, sender phone, optional proof). **Amount is copied from the active plan of the student's track+term by the DB, never from the client.** Statuses: `pending → approved | rejected` (final).
+- **Queue** (`v_payment_queue`, payments_reviewer): tabs معلّق (default, oldest first) / مقبول / مرفوض; filters: term, track, date range, search (student name/phone, sender phone); columns: created, student, phone, track, term, amount, sender phone, proof (thumb), status, reviewer/date, reject reason. Server-side pagination.
+- **Review drawer**: student info (name, phone, governorate, track, trial/subscriptions summary, previous requests count), expected amount, sender phone (copy button), proof image via **signed URL** from private bucket `payment-proofs` (zoom/rotate; «لا يوجد إيصال» when absent), **Approve** (optional `p_ends_at` override, defaults to term access end; if the term has none → blocker message telling an admin to set it) and **Reject** (reason required, ≥1 char, shown to the student). Both confirm dialogs. After success: row moves tabs, subscription link shown, student is notified by the DB.
+- Errors: `REQUEST_ALREADY_REVIEWED` (refresh row, explain who reviewed), `TERM_ACCESS_END_NOT_SET`, `ALREADY_SUBSCRIBED`, `REJECT_REASON_REQUIRED`, `REQUEST_NOT_FOUND`.
+- Payment methods: the schema has no method column. Show only what exists; document the gap.
+- Payment history per student (in student page) and CSV/XLSX export of the filtered queue.
+
+## 10. Students Management
+- **List** (`v_students_overview`, security_invoker): columns name, phone, guardian phone, governorate, administration, track, trial state (باقٍ N يوم / منتهية), active subscriptions count, blocked badge, created. Server-side search (name/phone), filters: governorate, administration (depends on governorate), stage, track, status (trial/subscribed/expired/blocked), created range; sort; page size 25/50/100; export (current filter).
+- **Student page tabs:** (1) البيانات — profile fields (read-only phone), actions below; (2) الاشتراكات والمدفوعات; (3) النشاط — `item_progress` summary and `quick_answers` (students_manager); (4) الامتحانات — attempts (status, started/submitted) and results (exams/students_manager); (5) الأجهزة والجلسات — `device_sessions` (support/students_manager).
+- **Actions:** extend trial (1–365 days) · block/unblock (reason optional; blocking ends sessions immediately) · change track (target must be an **active** track; warn that content/exam access switches immediately and old-track subscriptions don't cover the new track) · change governorate/administration (`update_student_location`; administrations list depends on governorate) · reset device session (support) · grant manual subscription (students_manager). Each needs a confirm dialog and writes the audit log (DB does it). Roles gate each action.
+- Not available (gaps): delete student, edit phone, reset password.
+- **Announcements link:** from a filtered list → «أرسل إعلانًا لهذه المجموعة» is **not** supported (announcement filters are only track/governorate); only offer sending by track/governorate in the Announcements module.
+
+## 11. Exams & Question Management (`exams` role)
+**Model:** `exams` (course, term, title, description, `duration_minutes` 5–300, `late_entry_minutes` 0–60 default 30, `disconnect_grace_seconds` 30–1800 default 300, `status` draft/published/archived) → `exam_questions` (position, type mcq|essay, `prompt_html`, `points` > 0) → `question_options` (MCQ only, exactly one correct) ; `exam_sessions` (name, `starts_at`, `ends_at` auto = start + duration) → `session_audience` rows (governorate / administration / track; null = any; **most specific match wins**).
+### 11.1 Exam builder (wizard with save-as-you-go drafts)
+1. **Basics** — dependent selects Stage → Track → Course (from `track_courses`) → Term (exam stores `course_id` + `term_id`), title, description, duration, late-entry window, disconnect grace. Audience banner: tracks that include the course (the DB requires the course to belong to ≥ 1 track at publish: `COURSE_NOT_IN_ANY_TRACK`).
+2. **Questions** — list with reorder; add MCQ (prompt via TipTap-lite: bold/italic/lists/images, points, 2–6 options, exactly one correct) or essay (prompt, points; **no options**: `ESSAY_CANNOT_HAVE_OPTIONS`); duplicate-question helper is client-side only (creates a new row); total points shown. Excel bulk import (§11.3).
+3. **Sessions & audience** — add sessions (name, start datetime, end shown read-only = start + duration; **must start in the future**: `SESSION_MUST_START_IN_FUTURE`) and audience rows per session (governorate, optional administration, optional track). Warn on ambiguity (two sessions equally specific for the same students → `AMBIGUOUS_AUDIENCE`) and show a **coverage preview**: for each governorate × track the matched session (computed with the same specificity rule) and counts of students per session from `profiles` counts, plus a list of eligible students matched to **no** session.
+4. **Review & Publish** — checklist: ≥1 question, MCQ validity, ≥1 session, every session has audience, no ambiguity, course in a track. Publish → `status='published'` (DB trigger decides; show returned code).
+- **Lock**: once any session has started the exam content is frozen (`EXAM_LOCKED`): UI switches to read-only with a «مقفول» badge; only archive and viewing remain. Never offer editing/deleting questions/sessions after lock (and don't hide the DB error if reached).
+### 11.2 Monitoring (`v_exam_session_stats`, exams)
+Per session: total attempts, in-progress, submitted, auto-submitted; auto-refresh every 15 s while a session is live; eligible-student count vs attempts (participation %). No student identities on this screen for the `exams` role (profiles are not readable by that role).
+### 11.3 Excel import of questions
+Template download with columns `type (mcq|essay), prompt, points, option_1..option_6, correct_option (1–6)`. Validate fully in browser (type, points > 0, MCQ 2–6 options, exactly one correct, essay without options, max 500 rows); show an errors table with row numbers; nothing is saved if any row fails. Save = insert questions (one request) then options (one request); if the second fails, delete the just-inserted questions (compensating rollback) and report. Rejected after lock.
+### 11.4 Statistics
+`question_stats(exam)`: attempts, answered, correct, % correct (MCQ), average essay score; flag questions < 20 % or > 95 % correct; score distribution from `exam_results` (after approval).
+
+## 12. Grading & Results Management
+**Flow (grader exports → grades offline/AI in Excel → grader imports → admin approves):**
+1. **Preconditions:** every session of the exam has ended (`SESSIONS_NOT_ENDED` otherwise); results not yet approved (`ALREADY_APPROVED`).
+2. **Export** (`export_grading`, grader): creates a batch, auto-submits leftovers, returns rows **with only** `answer_code` (anonymous), question position/text, answer text, max points, current score. Build XLSX columns **in this exact order**: `answer_code, question_position, question_text, answer_text, max_points, score` (score prefilled with current score). **No identity data anywhere.** Show batch id/time in history (`grading_batches`).
+3. **Import** (`import_grades(batch, rows, ai_flag)`): parse XLSX/CSV in browser; accept comma or dot decimals and Arabic-Indic digits (normalize); show a preview table with row-level validation before sending; checkbox «تم التصحيح بالذكاء الاصطناعي» (stored as `ai_graded`). All-or-nothing: on `IMPORT_REJECTED` render the DB's row/error list (`UNKNOWN_ANSWER_CODE, UNKNOWN_ESSAY_QUESTION, NO_ANSWER_FOR_THIS_QUESTION, INVALID_SCORE, SCORE_ABOVE_MAX, DUPLICATE_ROW, EMPTY_OR_INVALID_FILE`) and save nothing. Re-import overwrites per answer.
+4. **Approval** (`approve_grading`, **admin only**): shows pre-flight summary (attempts, essay answers graded/ungraded, AI-graded flag, sessions ended) → confirm → creates `exam_results` for every finished attempt (including auto-submitted) → locks the exam's grading (`ALREADY_APPROVED`), notifies students. Blocked with `UNGRADED_ANSWERS: N` (show N and how to fix).
+5. **After approval** (admin): «مراجعة المقالي» — `list_essay_answers` (shows student name; admin only) + `adjust_essay_grade(answer, score, reason)` (reason ≥ 3 chars, score ≤ max) recomputing the result; audited.
+6. Graders (role `grader`) only see Export/Import and batch history; `exams` role sees batches + results read-only.
+**Results screen** (`exam_results`, exams/students_manager): per exam table (student, MCQ, essay, total, max, %, AI flag), search/sort/filter, XLSX export, distribution chart (plain SVG), and student-level link. Results are visible to students only after approval **and** all sessions ended (informational).
+
+## 13. Dashboard & Reporting
+**No server aggregation exists** (no views/RPCs for sums). Use: (a) `count: 'exact', head: true` queries for counts; (b) for money and trends, fetch filtered rows page by page (cap 20,000 rows; if exceeded show «النتائج مقتطعة — ضيّق الفترة») and aggregate in the browser; document in `SCHEMA_GAPS.md`.
+- **Dashboard cards (role-aware):** pending payments (+oldest age) · students in trial / trial ending in 7 days · active subscriptions by term · students blocked · live/upcoming exam sessions (next 24 h) · attempts in progress · exams awaiting grading/approval · lessons draft vs published · terms with missing `access_ends_at` (alert) · last 10 audit events (admin).
+- **Reports (`/reports`)**, all with date range, term/track/stage filters, table + XLSX export: 1) **Revenue** — approved payments & subscriptions: total EGP, by term, by track/stage, by month, manual grants count (price 0) shown separately; 2) **Subscriptions** — active/expired/ending soon, renewal funnel (trial → paid) per term; 3) **Payments** — approval/rejection rate, avg review time, top reject reasons; 4) **Students** — sign-ups per day, by governorate/administration/track, trial conversion; 5) **Content coverage** — lessons per course/term/status, courses without published lessons; 6) **Exam participation & results** — attempts vs eligible, average score per exam/session, question difficulty; 7) **Engagement** — item completion rates per lesson (`item_progress`), quick-question accuracy (`quick_answers`).
+Charts: simple SVG components (bar/line) built in `packages/ui`; every chart has a data table fallback.
+
+## 14. Database-to-UI Mapping (authoritative)
+| Module / Screen | Reads | Writes / RPC | Key constraints surfaced in UI |
+|---|---|---|---|
+| Auth/roles | `staff_roles`(own), `staff_profiles`(own) | — | no role ⇒ unauthorized |
+| Dashboard | counts on `payment_requests`, `profiles`, `subscriptions`, `exams`, `exam_sessions`, `exam_attempts`, `lessons`, `terms`, `audit_log`, `v_exam_session_stats` | — | role-scoped RLS |
+| Stages / Tracks / Terms / Governorates / Administrations | same tables | insert/update/delete (admin) | unique names, FK restrict, `terms.access_ends_at` |
+| Courses & track links | `courses`, `track_courses`, `tracks`, `stages` | insert/update/delete (admin) | `name_ar` unique, composite PK link |
+| Content tree/lessons | `stages,tracks,track_courses,courses,terms,lessons,lesson_items` | `lessons`, `lesson_items`, `quick_questions`, `quick_question_options` CRUD (content) | publish triggers, shape check, order uniqueness, link domain check |
+| Allowed domains | `allowed_link_domains` | CRUD (admin) | domain lowercase, no scheme/path |
+| Images | storage `content-media` | upload/delete (content, exams) | jpeg/png/webp ≤5MB |
+| Plans / pricing matrix | `plans`, `tracks`, `terms` | CRUD (admin) | one active plan per track+term |
+| Subscriptions | `subscriptions` (+profile, track, term joins) | `grant_subscription` | no overlap, `ends_at > starts_at` |
+| Payments | `v_payment_queue`, `payment_requests`, storage `payment-proofs` (signed URL) | `approve_payment`, `reject_payment` | statuses, reason required, term end date |
+| Students | `v_students_overview`, `profiles`, `device_sessions`, `item_progress`, `quick_answers`, `exam_attempts`, `exam_results` | `extend_trial`, `set_student_blocked`, `change_student_track`, `update_student_location`, `reset_student_session` | role per RPC, active track only, admin∈governorate |
+| Announcements | `announcements` | `send_announcement(title, body, track?, governorate?)` | 2–120 / 2–1000 chars |
+| Exams authoring | `exams, exam_questions, question_options, exam_sessions, session_audience` | CRUD (exams) | lock, publish checks, one correct, positions, future start |
+| Monitoring/stats | `v_exam_session_stats`, `question_stats()` | — | — |
+| Grading | `grading_batches`, `essay_grades` | `export_grading`, `import_grades`, `approve_grading` | all-or-nothing, anonymity |
+| Results/review | `exam_results`, `list_essay_answers()` | `adjust_essay_grade` | admin only, reason |
+| Staff & roles | `staff_profiles`, `staff_roles` | insert/update/delete (admin); account creation via Edge Function `create-staff` (spec in `docs/edge-create-staff.md`; **if not deployed show a clear "not available" state**) | last admin protected (`LAST_ADMIN`) |
+| Audit | `audit_log` | — (append-only) | filters |
+| Year end | `year_end_reports` | `register_year_end_report`, `purge_year_end_details(year,'DELETE')` | irreversible, confirm by typing `DELETE` |
+| Reports | filtered row queries on the tables above | — | client-side aggregation caveat |
+
+## 15. API & Supabase Integration Requirements
+- Implement `data/client.ts` (`AdminApi`) with one method per row of §14; implement `data/supabase/*` for real (`supabase.from(...)`, `supabase.rpc(...)`, storage); keep `data/mock/*` for tests with identical behavior/error codes. Env: `VITE_SUPABASE_URL`, `VITE_SUPABASE_ANON_KEY`, `VITE_DATA_MODE=mock|supabase`. **Never** use the service-role key in the browser.
+- Auth: e-mail + password via Supabase Auth; **TOTP MFA** (Supabase MFA) mandatory for `admin` and `payments_reviewer`; idle timeout 30 min (warn at 28); sign-out clears all query caches and Zustand stores.
+- Query keys by factory (`keys.students.list(filters)`); every mutation invalidates the exact affected keys (e.g., approving a payment invalidates payment queue, subscriptions, dashboard counts, student detail).
+- Edge Function `create-staff` is specified only; UI calls it via `supabase.functions.invoke`; handle `NOT_FOUND`/non-deployed gracefully.
+- Date/time: always send ISO with offset; show in Africa/Cairo.
+- Contract tests (`tests/contract/*`): run the Supabase adapter against a local Supabase (`supabase start`, apply `supabase/migrations/*`, `seed.sql`) with test users per role; assert each §14 row (success + one denial + one constraint error). If Docker is unavailable, mark them skipped and say so in the report.
+
+## 16. UI/UX Requirements
+Design tokens only; RTL-correct icons/chevrons; dense but readable tables (TanStack Table, sticky header, column visibility, server pagination); consistent page frame (title, breadcrumbs, primary action at the left in RTL); forms with inline errors (Zod + server codes), disabled-submit while pending, unsaved-changes guard; confirm dialogs name the object and the consequence; toasts auto-dismiss, errors persistent until closed; keyboard shortcuts limited to Esc/Enter in dialogs; copy buttons for phones/ids; skeletons not spinners; empty states always suggest the next action; print-friendly CSS not required. Arabic copy is concise, professional, gender-neutral.
+
+## 17. Validation & Error Handling
+Client validation mirrors DB (Zod): phone `^01[0125][0-9]{8}$`; names/titles per column limits; points > 0; durations/limits as in §11; URLs https. **Server errors are authoritative.** Map to Arabic (complete list; unknown → «حدث خطأ غير متوقع» + copy-code button):
+`NOT_ALLOWED, UNAUTHENTICATED, LAST_ADMIN, INVALID_DAYS, REJECT_REASON_REQUIRED, REQUEST_ALREADY_REVIEWED, REQUEST_NOT_FOUND, ALREADY_SUBSCRIBED, PENDING_REQUEST_EXISTS, NO_PLAN_FOR_TRACK_TERM, TERM_ACCESS_END_NOT_SET, STUDENT_NOT_FOUND, TRACK_NOT_ACTIVE, ADMINISTRATION_NOT_IN_GOVERNORATE, LINK_DOMAIN_NOT_ALLOWED, LINK_MUST_BE_HTTPS, LESSON_HAS_NO_ITEMS, QUICK_QUESTION_INVALID, QUICK_QUESTIONS_ITEM_EMPTY, ITEM_IS_NOT_QUICK_QUESTIONS, EXAM_HAS_NO_QUESTIONS, EXAM_HAS_NO_SESSIONS, SESSION_WITHOUT_AUDIENCE, AMBIGUOUS_AUDIENCE, MCQ_INVALID, OPTIONS_ONLY_FOR_MCQ, ESSAY_CANNOT_HAVE_OPTIONS, COURSE_NOT_IN_ANY_TRACK, EXAM_LOCKED, SESSION_MUST_START_IN_FUTURE, SESSIONS_NOT_ENDED, UNGRADED_ANSWERS, ALREADY_APPROVED, BATCH_NOT_FOUND, IMPORT_REJECTED (+row table), SCORE_ABOVE_MAX, INVALID_SCORE, AUDIT_LOG_IS_APPEND_ONLY, ANNOUNCEMENT_EMPTY, ANNOUNCEMENT_TOO_LONG, ADJUST_REASON_REQUIRED, ANSWER_NOT_FOUND, INVALID_ACADEMIC_YEAR, PDF_PATH_REQUIRED, CONFIRMATION_REQUIRED, EMAIL_EXISTS, INVALID_ROLES, FILE_TOO_LARGE, FILE_TYPE_NOT_ALLOWED, FK_BLOCKED, DUPLICATE, CHECK_FAILED, REORDER_FAILED, NETWORK_OFFLINE`.
+`FK_BLOCKED` must name the blocking dependency when known (from the pre-check).
+
+## 18. Security & RLS Requirements
+- Trust the DB; **never** implement authorization only in React. Each mutation goes through the table/RPC that enforces the role; the UI additionally hides/guards by the §3 matrix.
+- Anonymity: the `grader` and `exams` roles must never receive student identity in grading screens; only `admin` sees names in essay review. Do not join profiles on those screens.
+- No secrets in the bundle/repo; no PII in URLs, logs, `localStorage` (only UI prefs); proof images only via short-lived signed URLs; HTML always sanitized before `dangerouslySetInnerHTML`; CSP-friendly (no inline scripts); idle timeout + MFA as above; sign-out invalidates caches.
+- Audit: the DB writes `audit_log` inside RPCs; the UI exposes it read-only (admin) with filters action/entity/actor/date and XLSX export.
+- Staff management: assign multiple roles; the last admin cannot be removed (`LAST_ADMIN`); an admin cannot remove their own admin role if they are the last.
+
+## 19. Implementation Plan (gate each phase with `pnpm typecheck && pnpm lint && pnpm test`)
+- **Phase 0 — Audit what exists** in `apps/admin` (a shallow admin was built from the old prompt). Produce `docs/AUDIT.md`: per module → implemented / shallow / missing / wrong vs this document, with a keep-or-rebuild decision. Keep working infrastructure (adapters, i18n, error map, layout) only if it matches §5; rebuild screens that are plain CRUD.
+- **Phase 1 — Foundations:** auth + MFA, role matrix/guards, layout, error pipeline, query-key factories, Zod schemas, mock + supabase adapter skeleton for reference data.
+- **Phase 2 — Academic structure + Plans/Terms/Settings** (§7, §8 pricing).
+- **Phase 3 — Content management** (§6) in full, including images, preview, publish rules, ordering.
+- **Phase 4 — Students, Subscriptions, Payments, Announcements** (§8–10).
+- **Phase 5 — Exams, Monitoring, Grading, Results, Stats, Year-end** (§11–12).
+- **Phase 6 — Dashboard, Reports, Audit, Staff** (§13, §18).
+- **Phase 7 — Supabase contract tests, e2e, accessibility pass, `docs/SCHEMA_GAPS.md`, `docs/OPEN_QUESTIONS.md`, `TEST_REPORT.md`.**
+Deliver incrementally; at the end of each phase commit with a message listing screens completed and acceptance IDs satisfied.
+
+## 20. Testing & Acceptance Criteria
+Unit/component tests for: error mapping, permission matrix, sanitizer, link-domain mirror, Excel parsers (questions & grades), dependent selects, pricing matrix, publish checklist, coverage preview. Playwright e2e on the mock adapter for **every** ID below (test names start with the ID); contract tests for the Supabase adapter (§15). Test users: admin, content, pay(payments_reviewer), exams, grader, mgr(students_manager), support. Seed: 27 governorates, 1 stage-3 grade with tracks (علمي علوم, أدبي), courses (فيزياء, كيمياء, لغة عربية) linked, 2 terms (term 1 with `access_ends_at`), plan 300 EGP (علمي, term 1), students (جيزة علمي ×2, القاهرة علمي, جيزة أدبي, expired-trial, blocked), a pending payment, a published lesson, an exam with two sessions.
+
+**A. Access & roles** — A1 each role sees exactly its sidebar items per §3; A2 direct URL to a forbidden route → unauthorized; A3 forbidden RPC (forced via API) → `NOT_ALLOWED` message, UI unchanged; A4 no-role user blocked; A5 MFA required for admin/payments_reviewer; A6 idle logout at 30 min with warning at 28 and caches cleared.
+**B. Curriculum structure** — B1 create stage/track/course/term; B2 duplicate names rejected (course name globally); B3 link course to two tracks → audience banner lists both and warns; B4 delete stage with tracks → blocked with dependency counts; B5 delete course with lessons/exams → blocked; B6 unlink course from track warns about immediate access loss; B7 deactivate track → disappears from student-facing choices but content unaffected (label states this); B8 term without `access_ends_at` → red alert on Dashboard/Payments; B9 coverage matrix matches data.
+**C. Content workflow** — C1 "Add lesson" selects are dependent (changing stage clears track/course; course list = only that track's courses; no units step exists); C2 lesson saved with `course_id`+`term_id`, appears under that course/term only; C3 sort order = last, no collision; C4 publish empty lesson → `LESSON_HAS_NO_ITEMS` + checklist; C5 article saves JSON+sanitized HTML (script/onerror stripped, foreign-host image stripped); C6 link: http → `LINK_MUST_BE_HTTPS`; unknown domain → `LINK_DOMAIN_NOT_ALLOWED`; `youtube.com.evil.com` rejected; YouTube ⇒ video + Android-only badge; Drive ⇒ document, no badge; C7 quick questions: two correct → rejected; publish without correct → `QUICK_QUESTION_INVALID`; item with no questions → `QUICK_QUESTIONS_ITEM_EMPTY`; C8 image upload 6 MB/ gif rejected before any request; valid png inserted; C9 preview shows student-style render, quick questions work with zero DB writes; C10 unpublish/archive hide from students (verified via mock student), publishing edit warning shown; C11 reorder lessons/items persists after reload (single bulk request); C12 delete item/lesson dialogs state cascade; published lesson with progress suggests archive; C13 global content search filters (stage/track/course/term/status) server-side; C14 dirty-state guard on navigation; C15 audience banner always present in lesson editor.
+**D. Pricing & subscriptions** — D1 pricing matrix shows active price per (track, term) and «غير مسعّر» for gaps; D2 second active plan for same pair rejected; deactivate → students get `NO_PLAN_FOR_TRACK_TERM` (mock student); D3 price ≤ 0 rejected; D4 price edit does not change existing subscriptions' price paid; D5 **no UI anywhere sets a price/subscription per course** (static check + e2e); D6 grant subscription defaults `ends_at` to term end, must be future; overlap → `ALREADY_SUBSCRIBED`; D7 subscriptions list filters (status/term/track/stage/dates) and search by student; D8 expired subscription removes access for the student (mock) and appears under «منتهي».
+**E. Payments** — E1 queue default pending oldest-first; E2 amount equals plan price; E3 proof opens via signed URL; request without proof shows «لا يوجد إيصال»; E4 approve → subscription created with price snapshot, row moves, student notified; E5 approve twice → `REQUEST_ALREADY_REVIEWED`; E6 approve when term has no end date and none entered → `TERM_ACCESS_END_NOT_SET`; E7 reject needs reason; student sees it; E8 non-reviewer cannot act; E9 filters/search/export match data.
+**F. Students** — F1 list filters/search/sort/pagination server-side; F2 extend trial 1–365 only; F3 block ends sessions and shows badge; unblock restores; F4 change track only to active track; F5 change location: administration must belong to governorate; F6 reset session = support only; F7 detail tabs show subscriptions, payments, progress, attempts per role visibility; F8 no delete/phone-edit/password-reset controls exist.
+**G. Exams** — G1 wizard dependent selects (stage→track→course→term), exam stored with course+term only (no unit field anywhere); G2 publish w/o questions → `EXAM_HAS_NO_QUESTIONS`; G3 MCQ needs ≥2 options and exactly one correct; essay with options → `ESSAY_CANNOT_HAVE_OPTIONS`; G4 session in the past → `SESSION_MUST_START_IN_FUTURE`; end = start + duration; G5 session without audience blocks publish; ambiguous audiences flagged; coverage preview lists uncovered students; G6 course not in any track blocks publish; G7 after first session starts everything read-only with lock badge; G8 Excel question import: template columns exact, errors table with row numbers, all-or-nothing, rejected after lock; G9 monitoring numbers update every 15 s; no student names for `exams` role; G10 question stats flag outliers.
+**H. Grading** — H1 export before sessions end → `SESSIONS_NOT_ENDED`; H2 exported XLSX has exactly the 6 columns, **no identity**; H3 bad code / score above max / invalid score / duplicate row / empty file → `IMPORT_REJECTED` with row table and nothing saved; H4 comma decimal accepted; AI flag stored; H5 re-import overwrites; H6 approve by non-admin impossible (button absent + API denial); H7 approve with ungraded answers → `UNGRADED_ANSWERS: N`; H8 approve creates results for every finished attempt incl. auto-submitted, then `ALREADY_APPROVED` blocks export/import/approve; H9 admin adjusts one essay grade (reason ≥3, ≤ max) → result recomputed and audited; H10 results table/export/distribution correct.
+**I. Announcements & year-end** — I1 send by track/governorate shows recipient count (non-blocked) before confirm; I2 empty/too-long rejected; I3 history lists sent items; I4 year-end: register PDF path, purge needs typing `DELETE`, affects only students with a report, audited.
+**J. Dashboard & reports** — J1 cards match counts and respect role; J2 revenue report totals = sum of approved subscriptions `price_paid_egp` (manual grants separate); J3 date/term/track/stage filters; J4 >20,000 rows shows truncation notice; J5 every report exports XLSX matching the table.
+**K. Staff & audit** — K1 create staff via Edge Function spec (graceful if absent); multiple roles; K2 removing last admin → `LAST_ADMIN`; K3 audit log lists payment decisions, grading actions, block/unblock, trial extension, session reset, grants, announcements; read-only; filters/export.
+**L. Quality** — L1 every screen has loading/empty/error states; L2 all strings Arabic/RTL, Latin digits, Cairo time; L3 keyboard/focus/aria; L4 no `any`, no `console.error`, no PII in URLs/storage; L5 **no dead buttons**: an automated e2e crawl clicks every visible primary control per role and asserts a real effect or a handled error; L6 `docs/SCHEMA_GAPS.md` lists all §2 gaps; L7 contract tests pass or are explicitly skipped with reason.
+**Definition of Done:** build OK, 0 TypeScript/ESLint errors, every ID above passing (or explicitly justified), `TEST_REPORT.md` (ID, pass/fail/skip, note), `AUDIT.md`, `SCHEMA_GAPS.md`, `OPEN_QUESTIONS.md` delivered.

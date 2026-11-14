@@ -1,0 +1,6 @@
+{
+  "name": "لوحة تحكم مجتمع ثانوية عامة",
+  "description": "منصة إدارة المحتوى التعليمي والطلاب والمدفوعات والامتحانات والتصحيح لمجتمع ثانوية عامة",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
