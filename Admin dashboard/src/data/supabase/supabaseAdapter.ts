@@ -6,6 +6,7 @@ import type {
   ExamDetailData,
   LessonDetailData,
   LessonsFilter,
+  MfaEnrollmentData,
   PaymentQueueFilter,
   ReportBundle,
   ReportsFilter,
@@ -77,6 +78,21 @@ function getRange(page = 1, pageSize = 25): [number, number] {
   return [from, from + pageSize - 1];
 }
 
+export function normalizeQrDataUri(rawQr: string): string {
+  const trimmed = rawQr.trim();
+  if (!trimmed) return '';
+  const utf8Prefix = 'data:image/svg+xml;utf-8,';
+  if (trimmed.toLowerCase().startsWith(utf8Prefix)) {
+    const body = trimmed.slice(utf8Prefix.length);
+    if (body.includes('<') || body.includes('#')) {
+      return `${utf8Prefix}${encodeURIComponent(body)}`;
+    }
+    return trimmed;
+  }
+  if (trimmed.startsWith('data:')) return trimmed;
+  return `${utf8Prefix}${encodeURIComponent(trimmed)}`;
+}
+
 export class SupabaseAdminApi implements AdminApi {
   private sb: ReturnType<typeof getSupabaseClient>;
 
@@ -90,7 +106,7 @@ export class SupabaseAdminApi implements AdminApi {
     const user = data.session?.user;
     if (!user) return null;
 
-    const [profileRes, rolesRes, aalRes] = await Promise.all([
+    const [profileRes, rolesRes, aalRes, factorsRes] = await Promise.all([
       this.sb
         .from('staff_profiles')
         .select('user_id, full_name, created_at, updated_at')
@@ -98,9 +114,12 @@ export class SupabaseAdminApi implements AdminApi {
         .maybeSingle(),
       this.sb.from('staff_roles').select('role').eq('user_id', user.id),
       this.sb.auth.mfa.getAuthenticatorAssuranceLevel(),
+      this.sb.auth.mfa.listFactors(),
     ]);
     if (profileRes.error) throw normalizeError(profileRes.error);
     if (rolesRes.error) throw normalizeError(rolesRes.error);
+    if (aalRes.error) throw normalizeError(aalRes.error);
+    if (factorsRes.error) throw normalizeError(factorsRes.error);
 
     const roles = ((rolesRes.data ?? []) as Array<{ role: StaffRole }>).map((r) => r.role);
     const profileRow = profileRes.data as {
@@ -109,8 +128,17 @@ export class SupabaseAdminApi implements AdminApi {
       created_at: string;
       updated_at: string;
     } | null;
+
+    const verifiedTotp = (factorsRes.data?.totp ?? []).filter(
+      (f) => f.status === 'verified' && f.factor_type === 'totp'
+    );
+    const mfaEnrolled = verifiedTotp.length > 0;
+    const verifiedTotpFactorId = verifiedTotp[0]?.id ?? null;
+    const aalCurrentLevel = (aalRes.data?.currentLevel ?? null) as 'aal1' | 'aal2' | null;
+    const aalNextLevel = (aalRes.data?.nextLevel ?? null) as 'aal1' | 'aal2' | null;
+
     const mfaReq = requiresMfa(roles);
-    const mfaVerified = !mfaReq || aalRes.data?.currentLevel === 'aal2';
+    const mfaVerified = !mfaReq || aalCurrentLevel === 'aal2';
 
     return {
       userId: user.id,
@@ -128,6 +156,10 @@ export class SupabaseAdminApi implements AdminApi {
       roles,
       mfaRequired: mfaReq,
       mfaVerified,
+      mfaEnrolled,
+      verifiedTotpFactorId,
+      aalCurrentLevel,
+      aalNextLevel,
     };
   }
 
@@ -139,19 +171,62 @@ export class SupabaseAdminApi implements AdminApi {
     return sess;
   }
 
-  async verifyMfa(code: string): Promise<AuthSessionState> {
+  async enrollMfa(): Promise<MfaEnrollmentData> {
     const { data: factors, error: fErr } = await this.sb.auth.mfa.listFactors();
     if (fErr) throw normalizeError(fErr);
-    const totp = factors.totp[0];
-    if (!totp) throw new AppError('NOT_ALLOWED', 'لم يتم ربط تطبيق المصادقة الثنائية TOTP لهذا الحساب.');
-    const { data: challenge, error: cErr } = await this.sb.auth.mfa.challenge({ factorId: totp.id });
-    if (cErr) throw normalizeError(cErr);
-    const { error: vErr } = await this.sb.auth.mfa.verify({
-      factorId: totp.id,
-      challengeId: challenge.id,
-      code,
+
+    const unverifiedLeftovers = (factors?.all ?? []).filter(
+      (f) => f.factor_type === 'totp' && f.status !== 'verified'
+    );
+    for (const factor of unverifiedLeftovers) {
+      const { error: uErr } = await this.sb.auth.mfa.unenroll({ factorId: factor.id });
+      if (uErr) throw normalizeError(uErr);
+    }
+
+    const { data, error: eErr } = await this.sb.auth.mfa.enroll({
+      factorType: 'totp',
+      friendlyName: 'Admin',
+    });
+    if (eErr) throw normalizeError(eErr);
+    if (!data || data.type !== 'totp') {
+      throw new AppError('UNKNOWN', 'تعذر إنشاء عامل التحقق الثنائي TOTP.');
+    }
+
+    const qrCode = normalizeQrDataUri(data.totp.qr_code ?? '');
+
+    return {
+      factorId: data.id,
+      qrCode,
+      secret: data.totp.secret,
+      uri: data.totp.uri,
+    };
+  }
+
+  async verifyMfa(code: string, factorId?: string): Promise<AuthSessionState> {
+    let targetFactorId = factorId;
+    if (!targetFactorId) {
+      const { data: factors, error: fErr } = await this.sb.auth.mfa.listFactors();
+      if (fErr) throw normalizeError(fErr);
+      targetFactorId =
+        factors?.totp?.[0]?.id ??
+        factors?.all?.find((f) => f.factor_type === 'totp')?.id;
+    }
+
+    if (!targetFactorId) {
+      throw new AppError('NOT_ALLOWED', 'لم يتم ربط تطبيق المصادقة الثنائية TOTP لهذا الحساب.');
+    }
+
+    const { error: vErr } = await this.sb.auth.mfa.challengeAndVerify({
+      factorId: targetFactorId,
+      code: code.trim(),
     });
     if (vErr) throw normalizeError(vErr);
+
+    if (typeof this.sb.auth.refreshSession === 'function') {
+      const { error: rErr } = await this.sb.auth.refreshSession();
+      if (rErr) throw normalizeError(rErr);
+    }
+
     const sess = await this.getCurrentSession();
     if (!sess) throw new AppError('UNAUTHENTICATED');
     return sess;

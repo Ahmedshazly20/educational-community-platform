@@ -27,6 +27,7 @@ import { useAuthStore } from '../stores/authStore';
 import { useUiStore } from '../stores/uiStore';
 import { queryClient } from './AppProviders';
 import { Button, ModalShell } from '../components/ui/Primitives';
+import { TotpEnrollPanel } from '../features/auth/TotpEnrollPanel';
 
 const NAV_ICONS: Record<NavModuleId, React.ReactNode> = {
   dashboard: <LayoutDashboard className="h-4 w-4" />,
@@ -57,11 +58,13 @@ export function AppLayout() {
   const touchActivity = useAuthStore((s) => s.touchActivity);
   const setIdleWarningVisible = useAuthStore((s) => s.setIdleWarningVisible);
   const signOut = useAuthStore((s) => s.signOut);
+  const setSession = useAuthStore((s) => s.setSession);
 
   const sidebarOpen = useUiStore((s) => s.sidebarOpen);
   const setSidebarOpen = useUiStore((s) => s.setSidebarOpen);
   const toggleSidebar = useUiStore((s) => s.toggleSidebar);
   const navigate = useNavigate();
+  const [mfaModalOpen, setMfaModalOpen] = React.useState(false);
 
   const handleLogout = React.useCallback(async () => {
     queryClient.clear();
@@ -151,6 +154,16 @@ export function AppLayout() {
               {session?.profile?.full_name ?? session?.email}
             </p>
             <p className="mt-0.5 truncate text-xs text-slate-500">{roleLabels}</p>
+            {session && !session.mfaEnrolled && (
+              <button
+                type="button"
+                onClick={() => setMfaModalOpen(true)}
+                className="mt-2 inline-flex items-center gap-1.5 text-xs font-medium text-g700 hover:text-g800 hover:underline cursor-pointer"
+              >
+                <ShieldCheck className="h-3.5 w-3.5" />
+                {ar.auth.mfaOptionalEnable}
+              </button>
+            )}
           </div>
           <Button
             variant="secondary"
@@ -180,10 +193,10 @@ export function AppLayout() {
           </div>
 
           <div className="flex items-center gap-4 text-xs text-slate-600">
-            {session?.mfaVerified && session.mfaRequired && (
-              <span className="inline-flex items-center gap-1 text-emerald-700 font-medium">
+            {session?.mfaEnrolled && (
+              <span className="inline-flex items-center gap-1 font-medium text-emerald-700">
                 <ShieldCheck className="h-4 w-4" />
-                تحقق ثنائي مفعّل
+                {ar.auth.mfaEnabledBadge}
               </span>
             )}
             <span className="hidden sm:inline">{session?.email}</span>
@@ -210,6 +223,22 @@ export function AppLayout() {
           </Button>
           <Button onClick={() => touchActivity()}>{ar.app.staySignedIn}</Button>
         </div>
+      </ModalShell>
+
+      <ModalShell
+        open={mfaModalOpen}
+        title={ar.auth.mfaOptionalModalTitle}
+        onClose={() => setMfaModalOpen(false)}
+        maxWidth="max-w-md"
+      >
+        <p className="mb-4 text-xs text-slate-600">{ar.auth.mfaOptionalModalDesc}</p>
+        <TotpEnrollPanel
+          onSuccess={(updated) => {
+            setSession(updated);
+            setMfaModalOpen(false);
+          }}
+          onCancel={() => setMfaModalOpen(false)}
+        />
       </ModalShell>
     </div>
   );

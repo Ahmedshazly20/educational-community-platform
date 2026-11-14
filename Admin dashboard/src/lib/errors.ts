@@ -128,14 +128,59 @@ export function normalizeError(err: unknown): AppError {
       return new AppError('NOT_ALLOWED', ar.errors.NOT_ALLOWED, { rawCode: sqlState });
     }
 
+    const errCode = typeof (pg as { code?: unknown }).code === 'string' ? (pg as { code: string }).code : '';
+    const lowerMsg = msg.toLowerCase();
+
     if (
-      msg.toLowerCase().includes('invalid login credentials') ||
-      (pg as { code?: string }).code === 'invalid_credentials'
+      errCode === 'mfa_totp_enroll_not_enabled' ||
+      errCode === 'mfa_totp_verify_not_enabled' ||
+      (lowerMsg.includes('totp') && lowerMsg.includes('not enabled')) ||
+      (lowerMsg.includes('mfa') && lowerMsg.includes('enroll') && lowerMsg.includes('not enabled'))
+    ) {
+      return new AppError('MFA_NOT_ENABLED', ar.errors.MFA_NOT_ENABLED, {
+        rawCode: errCode || msg,
+      });
+    }
+
+    if (
+      errCode === 'mfa_challenge_expired' ||
+      (lowerMsg.includes('challenge') && lowerMsg.includes('expired'))
+    ) {
+      return new AppError('MFA_CHALLENGE_EXPIRED', ar.errors.MFA_CHALLENGE_EXPIRED, {
+        rawCode: errCode || msg,
+      });
+    }
+
+    if (
+      errCode === 'mfa_verification_failed' ||
+      errCode === 'mfa_verification_rejected' ||
+      lowerMsg.includes('invalid totp') ||
+      lowerMsg.includes('invalid verification code') ||
+      lowerMsg.includes('invalid mfa')
+    ) {
+      return new AppError('MFA_INVALID_CODE', ar.errors.MFA_INVALID_CODE, {
+        rawCode: errCode || msg,
+      });
+    }
+
+    if (
+      errCode === 'too_many_enrolled_mfa_factors' ||
+      errCode === 'mfa_factor_name_conflict' ||
+      errCode === 'mfa_verified_factor_exists'
+    ) {
+      return new AppError('MFA_TOO_MANY_FACTORS', ar.errors.MFA_TOO_MANY_FACTORS, {
+        rawCode: errCode || msg,
+      });
+    }
+
+    if (
+      lowerMsg.includes('invalid login credentials') ||
+      errCode === 'invalid_credentials'
     ) {
       return new AppError('INVALID_CREDENTIALS', ar.errors.INVALID_CREDENTIALS, { rawCode: msg || 'invalid_credentials' });
     }
 
-    if (msg.toLowerCase().includes('failed to fetch') || msg.toLowerCase().includes('network')) {
+    if (lowerMsg.includes('failed to fetch') || lowerMsg.includes('network')) {
       return new AppError('NETWORK_OFFLINE', ar.errors.NETWORK_OFFLINE, { rawCode: msg });
     }
 

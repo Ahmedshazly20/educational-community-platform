@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { TABLE_SCHEMA, RPC_SCHEMA, ENUM_VALUES } from './schemaContract';
-import { SupabaseAdminApi } from './supabaseAdapter';
+import { SupabaseAdminApi, normalizeQrDataUri } from './supabaseAdapter';
 import { normalizeSupabaseUrl } from './supabaseClient';
 import { AppError } from '../../lib/errors';
 
@@ -599,8 +599,22 @@ function createFakeSupabaseClient(
         error: null,
       }),
       signInWithPassword: async () => ({ error: null }),
+      refreshSession: async () => ({ data: { session: null, user: null }, error: null }),
       mfa: {
-        getAuthenticatorAssuranceLevel: async () => ({ data: { currentLevel: 'aal2' }, error: null }),
+        getAuthenticatorAssuranceLevel: async () => ({
+          data: { currentLevel: 'aal2', nextLevel: 'aal2' },
+          error: null,
+        }),
+        listFactors: async () => ({
+          data: {
+            all: [{ id: 'totp-1', factor_type: 'totp', status: 'verified' }],
+            totp: [{ id: 'totp-1', factor_type: 'totp', status: 'verified' }],
+          },
+          error: null,
+        }),
+        enroll: async () => ({ data: null, error: null }),
+        unenroll: async () => ({ data: null, error: null }),
+        challengeAndVerify: async () => ({ data: null, error: null }),
       },
     },
     from,
@@ -750,5 +764,173 @@ test('normalizeSupabaseUrl strips accidental /rest/v1 suffix and trailing slashe
     normalizeSupabaseUrl('https://wmqfxjzbjhpxcilqjpff.supabase.co/'),
     'https://wmqfxjzbjhpxcilqjpff.supabase.co'
   );
+});
+
+test('SupabaseAdminApi MFA enrollment cleans up unverified leftovers, enrolls QR+secret, and verifies via challengeAndVerify to AAL2', async () => {
+  let currentLevel: 'aal1' | 'aal2' = 'aal1';
+  let nextLevel: 'aal1' | 'aal2' = 'aal1';
+  const factorsState: Array<{ id: string; factor_type: 'totp'; status: 'verified' | 'unverified' }> = [
+    { id: 'stale-unverified-1', factor_type: 'totp', status: 'unverified' },
+  ];
+  const calls: string[] = [];
+
+  const mockSb = {
+    auth: {
+      getSession: async () => ({
+        data: { session: { user: { id: 'admin-1', email: 'admin@example.com' } } },
+        error: null,
+      }),
+      signInWithPassword: async () => ({ error: null }),
+      refreshSession: async () => {
+        calls.push('refreshSession');
+        return { data: { session: null, user: null }, error: null };
+      },
+      mfa: {
+        getAuthenticatorAssuranceLevel: async () => {
+          calls.push('getAuthenticatorAssuranceLevel');
+          return { data: { currentLevel, nextLevel }, error: null };
+        },
+        listFactors: async () => {
+          calls.push('listFactors');
+          return {
+            data: {
+              all: [...factorsState],
+              totp: factorsState.filter((f) => f.status === 'verified'),
+            },
+            error: null,
+          };
+        },
+        unenroll: async ({ factorId }: { factorId: string }) => {
+          calls.push(`unenroll:${factorId}`);
+          const idx = factorsState.findIndex((f) => f.id === factorId);
+          if (idx >= 0) factorsState.splice(idx, 1);
+          return { data: { id: factorId }, error: null };
+        },
+        enroll: async (params: { factorType: string; friendlyName: string }) => {
+          calls.push(`enroll:${params.factorType}:${params.friendlyName}`);
+          factorsState.push({ id: 'fresh-totp-1', factor_type: 'totp', status: 'unverified' });
+          return {
+            data: {
+              id: 'fresh-totp-1',
+              type: 'totp',
+              totp: {
+                qr_code: 'data:image/svg+xml;utf-8,<svg></svg>',
+                secret: 'SECRETBASE32KEY',
+                uri: 'otpauth://totp/Admin?secret=SECRETBASE32KEY',
+              },
+            },
+            error: null,
+          };
+        },
+        challengeAndVerify: async ({ factorId, code }: { factorId: string; code: string }) => {
+          calls.push(`challengeAndVerify:${factorId}:${code}`);
+          const f = factorsState.find((x) => x.id === factorId);
+          if (f) f.status = 'verified';
+          currentLevel = 'aal2';
+          nextLevel = 'aal2';
+          return { data: { access_token: 'aal2-jwt' }, error: null };
+        },
+      },
+    },
+    from: (table: string) => ({
+      select: () => ({
+        eq: () => ({
+          maybeSingle: async () =>
+            table === 'staff_profiles'
+              ? {
+                  data: {
+                    user_id: 'admin-1',
+                    full_name: 'مدير',
+                    created_at: '2026-01-01T00:00:00Z',
+                    updated_at: '2026-01-01T00:00:00Z',
+                  },
+                  error: null,
+                }
+              : { data: null, error: null },
+          then: (fn: (v: unknown) => unknown) =>
+            Promise.resolve({ data: [{ role: 'admin' }], error: null }).then(fn),
+        }),
+      }),
+    }),
+  } as unknown as ConstructorParameters<typeof SupabaseAdminApi>[0];
+
+  const api = new SupabaseAdminApi(mockSb);
+
+  // 1) Initial sign-in has no verified factor -> mfaRequired=true, mfaEnrolled=false, mfaVerified=false
+  const initialSession = await api.signIn('admin@example.com', 'pw');
+  assert.equal(initialSession.mfaRequired, true);
+  assert.equal(initialSession.mfaEnrolled, false);
+  assert.equal(initialSession.mfaVerified, false);
+
+  // 2) Enroll cleans up stale unverified factor and returns QR SVG URI + secret
+  const enrolled = await api.enrollMfa();
+  assert.equal(enrolled.factorId, 'fresh-totp-1');
+  assert.equal(enrolled.secret, 'SECRETBASE32KEY');
+  assert.ok(enrolled.qrCode.startsWith('data:image/svg+xml'));
+  assert.ok(calls.includes('unenroll:stale-unverified-1'));
+  assert.ok(calls.includes('enroll:totp:Admin'));
+
+  // 3) Verify calls challengeAndVerify + refreshSession and transitions session to AAL2
+  const verified = await api.verifyMfa('654321', enrolled.factorId);
+  assert.ok(calls.includes('challengeAndVerify:fresh-totp-1:654321'));
+  assert.ok(calls.includes('refreshSession'));
+  assert.equal(verified.mfaEnrolled, true);
+  assert.equal(verified.mfaVerified, true);
+  assert.equal(verified.aalCurrentLevel, 'aal2');
+});
+
+test('SupabaseAdminApi allows non-MFA roles (content/support/exams/grader/students_manager) to log in at AAL1 without MFA', async () => {
+  for (const role of ['content', 'exams', 'grader', 'students_manager', 'support'] as const) {
+    const mockSb = {
+      auth: {
+        getSession: async () => ({
+          data: { session: { user: { id: `u-${role}`, email: `${role}@example.com` } } },
+          error: null,
+        }),
+        signInWithPassword: async () => ({ error: null }),
+        mfa: {
+          getAuthenticatorAssuranceLevel: async () => ({
+            data: { currentLevel: 'aal1', nextLevel: 'aal1' },
+            error: null,
+          }),
+          listFactors: async () => ({ data: { all: [], totp: [] }, error: null }),
+        },
+      },
+      from: (table: string) => ({
+        select: () => ({
+          eq: () => ({
+            maybeSingle: async () =>
+              table === 'staff_profiles'
+                ? {
+                    data: {
+                      user_id: `u-${role}`,
+                      full_name: role,
+                      created_at: '2026-01-01T00:00:00Z',
+                      updated_at: '2026-01-01T00:00:00Z',
+                    },
+                    error: null,
+                  }
+                : { data: null, error: null },
+            then: (fn: (v: unknown) => unknown) =>
+              Promise.resolve({ data: [{ role }], error: null }).then(fn),
+          }),
+        }),
+      }),
+    } as unknown as ConstructorParameters<typeof SupabaseAdminApi>[0];
+
+    const api = new SupabaseAdminApi(mockSb);
+    const sess = await api.signIn(`${role}@example.com`, 'pw');
+    assert.equal(sess.mfaRequired, false);
+    assert.equal(sess.mfaVerified, true);
+    assert.equal(sess.mfaEnrolled, false);
+  }
+});
+
+test('normalizeQrDataUri encodes unencoded SVG data URIs containing # colors without double-encoding', () => {
+  const unencoded = 'data:image/svg+xml;utf-8,<svg xmlns="http://www.w3.org/2000/svg"><rect fill="#000"/></svg>';
+  const normalized = normalizeQrDataUri(unencoded);
+  assert.ok(normalized.startsWith('data:image/svg+xml;utf-8,%3Csvg'));
+  assert.ok(!normalized.includes('#'));
+  assert.equal(normalizeQrDataUri(normalized), normalized);
 });
 

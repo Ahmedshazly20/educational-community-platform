@@ -6,6 +6,7 @@ import type {
   ExamDetailData,
   LessonDetailData,
   LessonsFilter,
+  MfaEnrollmentData,
   PaymentQueueFilter,
   ReportBundle,
   ReportsFilter,
@@ -287,6 +288,10 @@ export class MockAdminApi implements AdminApi {
         roles: [],
         mfaRequired: false,
         mfaVerified: true,
+        mfaEnrolled: false,
+        verifiedTotpFactorId: null,
+        aalCurrentLevel: 'aal1',
+        aalNextLevel: 'aal1',
       };
       this.session = noRoleSess;
       this.persistSession();
@@ -306,17 +311,39 @@ export class MockAdminApi implements AdminApi {
       roles: found.roles,
       mfaRequired: mfaReq,
       mfaVerified: !mfaReq,
+      mfaEnrolled: mfaReq,
+      verifiedTotpFactorId: mfaReq ? `mock-factor-${found.id}` : null,
+      aalCurrentLevel: 'aal1',
+      aalNextLevel: mfaReq ? 'aal2' : 'aal1',
     };
     this.persistSession();
     return this.session;
   }
 
-  async verifyMfa(code: string): Promise<AuthSessionState> {
+  async enrollMfa(): Promise<MfaEnrollmentData> {
+    if (!this.session) throw new AppError('UNAUTHENTICATED');
+    const svg =
+      '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120"><rect width="120" height="120" fill="#fff"/><rect x="12" y="12" width="32" height="32" fill="#0f172a"/><rect x="76" y="12" width="32" height="32" fill="#0f172a"/><rect x="12" y="76" width="32" height="32" fill="#0f172a"/><rect x="54" y="54" width="16" height="16" fill="#0f172a"/></svg>';
+    return {
+      factorId: `mock-factor-${this.session.userId}`,
+      qrCode: `data:image/svg+xml;utf-8,${encodeURIComponent(svg)}`,
+      secret: 'JBSWY3DPEHPK3PXP',
+    };
+  }
+
+  async verifyMfa(code: string, factorId?: string): Promise<AuthSessionState> {
     if (!this.session) throw new AppError('UNAUTHENTICATED');
     if (code.trim() !== '123456') {
-      throw new AppError('CHECK_FAILED', 'رمز التحقق غير صحيح (استخدم 123456 في وضع المحاكاة).');
+      throw new AppError('MFA_INVALID_CODE', 'رمز التحقق غير صحيح (استخدم 123456 في وضع المحاكاة).');
     }
-    this.session = { ...this.session, mfaVerified: true };
+    this.session = {
+      ...this.session,
+      mfaVerified: true,
+      mfaEnrolled: true,
+      verifiedTotpFactorId: factorId ?? this.session.verifiedTotpFactorId ?? `mock-factor-${this.session.userId}`,
+      aalCurrentLevel: 'aal2',
+      aalNextLevel: 'aal2',
+    };
     this.persistSession();
     return this.session;
   }

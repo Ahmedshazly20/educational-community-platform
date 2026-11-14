@@ -60,3 +60,26 @@ test('maps PostgreSQL 42703 and 42P01 errors to خطأ في اتصال البي�
   assert.equal(authErr.code, 'INVALID_CREDENTIALS');
   assert.match(getErrorMessage(authErr), /غير صحيحة/);
 });
+
+test('maps Supabase MFA errors (not enabled, invalid code, expired challenge) to Arabic messages', () => {
+  const notEnabled = normalizeError({
+    code: 'mfa_totp_enroll_not_enabled',
+    message: 'TOTP factor enrollment is not enabled',
+  });
+  assert.equal(notEnabled.code, 'MFA_NOT_ENABLED');
+  assert.match(getErrorMessage(notEnabled), /غير مفعّل/);
+
+  const invalidCode = normalizeError({
+    code: 'mfa_verification_failed',
+    message: 'Invalid TOTP code entered',
+  });
+  assert.equal(invalidCode.code, 'MFA_INVALID_CODE');
+  assert.match(getErrorMessage(invalidCode), /رمز التحقق غير صحيح/);
+
+  const expired = normalizeError({
+    code: 'mfa_challenge_expired',
+    message: 'MFA challenge has expired',
+  });
+  assert.equal(expired.code, 'MFA_CHALLENGE_EXPIRED');
+  assert.match(getErrorMessage(expired), /انتهت صلاحية التحدي/);
+});

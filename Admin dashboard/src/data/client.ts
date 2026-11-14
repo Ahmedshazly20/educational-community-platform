@@ -52,6 +52,17 @@ export interface AuthSessionState {
   roles: StaffRole[];
   mfaRequired: boolean;
   mfaVerified: boolean;
+  mfaEnrolled: boolean;
+  verifiedTotpFactorId?: string | null;
+  aalCurrentLevel?: 'aal1' | 'aal2' | null;
+  aalNextLevel?: 'aal1' | 'aal2' | null;
+}
+
+export interface MfaEnrollmentData {
+  factorId: string;
+  qrCode: string;
+  secret: string;
+  uri?: string;
 }
 
 export interface LessonsFilter {
@@ -163,7 +174,8 @@ export interface AdminApi {
   // Auth & MFA
   getCurrentSession(): Promise<AuthSessionState | null>;
   signIn(email: string, password: string): Promise<AuthSessionState>;
-  verifyMfa(code: string): Promise<AuthSessionState>;
+  enrollMfa(): Promise<MfaEnrollmentData>;
+  verifyMfa(code: string, factorId?: string): Promise<AuthSessionState>;
   signOut(): Promise<void>;
 
   // Dashboard

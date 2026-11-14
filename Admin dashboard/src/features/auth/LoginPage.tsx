@@ -7,6 +7,7 @@ import { getErrorMessage } from '../../lib/errors';
 import { useAuthStore } from '../../stores/authStore';
 import { queryClient } from '../../app/AppProviders';
 import { Button, FieldError, Surface } from '../../components/ui/Primitives';
+import { TotpEnrollPanel } from './TotpEnrollPanel';
 
 const MOCK_ACCOUNTS = [
   { email: 'admin@thanawya.edu.eg', label: 'مدير عام (يتطلب MFA)' },
@@ -59,7 +60,7 @@ export function LoginPage() {
     setErrorMsg(null);
     setLoading(true);
     try {
-      const updated = await api.verifyMfa(mfaCode);
+      const updated = await api.verifyMfa(mfaCode, session?.verifiedTotpFactorId ?? undefined);
       setSession(updated);
     } catch (err) {
       setErrorMsg(getErrorMessage(err));
@@ -132,6 +133,11 @@ export function LoginPage() {
                 {ar.auth.signIn}
               </Button>
             </form>
+          ) : !session?.mfaEnrolled ? (
+            <TotpEnrollPanel
+              onSuccess={(updated) => setSession(updated)}
+              onCancel={() => void api.signOut().then(() => setSession(null))}
+            />
           ) : (
             <form onSubmit={handleMfa} className="space-y-4">
               <div className="flex items-center gap-2 text-g700">
@@ -152,6 +158,7 @@ export function LoginPage() {
                   id="mfa-code"
                   type="text"
                   inputMode="numeric"
+                  autoComplete="one-time-code"
                   maxLength={6}
                   required
                   value={mfaCode}
